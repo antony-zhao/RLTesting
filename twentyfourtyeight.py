@@ -17,11 +17,12 @@ class Trajectory(eqx.Module):
 class MLP(eqx.Module):
     input_layer: eqx.Module
     hiddens: list
-    action: eqx.Module
+    output_layer: eqx.Module
     act: Callable
     skip_connections: bool
+    output_act: Callable
     
-    def __init__(self, input_dim, output_dim, key, hidden_dim=256, num_hiddens=3, act=jax.nn.selu, hidden_dims=None):
+    def __init__(self, input_dim, output_dim, key, hidden_dim=256, num_hiddens=3, act=jax.nn.selu, hidden_dims=None, output_act=None):
         # Can specify hidden_dims if want more precise control, but generally keeping them the same should be "good enough," we also
         # assume that if there aren't specified hidden dims, that we can use skip connections
         if hidden_dims is not None:
@@ -40,8 +41,9 @@ class MLP(eqx.Module):
             else:
                 self.hiddens.append(eqx.nn.Linear(hidden_dim, hidden_dims[i + 1], key=subkey))
                 hidden_dim = hidden_dims[i + 1]
-        self.action = eqx.nn.Linear(hidden_dim, output_dim, key=key)
+        self.output_layer = eqx.nn.Linear(hidden_dim, output_dim, key=key)
         self.act = act
+        self.output_act = output_act
     
     def __call__(self, x):
         x = self.act(self.input_layer(x))
@@ -50,35 +52,40 @@ class MLP(eqx.Module):
                 x = self.act(self.hiddens[i](x)) + x
             else:
                 x = self.act(self.hiddens[i](x))
-        action_logits = self.action(x)
-        return action_logits
-
-    def policy_fn(self, x, legal_action_mask, key, obs_wrapper=None):
+        logits = self.output_layer(x)
+        if self.output_act is not None:
+            return self.output_act(logits)
+        return logits
+    
+def make_policy_fn(model, obs_wrapper=None):
+    def policy_fn(x, legal_action_mask, key):
         if obs_wrapper is not None:
             x = obs_wrapper(x)
-        action_logits = jax.vmap(self)(x)
+        action_logits = jax.vmap(model)(x)
         action_logits = jnp.where(legal_action_mask, action_logits, -jnp.inf)
         actions = jax.random.categorical(key, action_logits) 
         action_dist = jax.nn.softmax(action_logits)
         action_probs = jnp.take_along_axis(action_dist, jnp.expand_dims(actions, 1), axis=1)
         return actions, action_probs
+    return policy_fn
 
-def collect_trajectory(step, state, current_obs, policy, key, num_timesteps, obs_wrapper=None):
+def collect_trajectory(step, state, current_obs, policy, key, num_timesteps):
     # slightly inspired by the brax code, but just trying to implement from memory to learn
+    @jax.jit
     def f(carry, _):
         state, current_obs, key = carry
         random_key, key = jax.random.split(key)
-        next_state, next_obs, trajectory = single_step(step, state, current_obs, policy, random_key, obs_wrapper)
+        next_state, next_obs, trajectory = single_step(step, state, current_obs, policy, random_key)
         return (next_state, next_obs, key), trajectory
     
-    (_, final_obs, _), trajectory = jax.lax.scan(f, (state, current_obs, key), (), num_timesteps) # note to self that scan returns ys in a stacked way.
-    return final_obs, trajectory
+    (next_state, final_obs, _), trajectory = jax.lax.scan(f, (state, current_obs, key), (), num_timesteps) # note to self that scan returns ys in a stacked way.
+    return next_state, final_obs, trajectory
 
-def single_step(step, state, current_obs, policy, key, obs_wrapper=None):
+def single_step(step, state, current_obs, policy, key):
     key, subkey = jax.random.split(key)
     batch_size = current_obs.shape[0]
     keys = jax.random.split(subkey, batch_size)
-    action, action_probs = policy(current_obs, state.legal_action_mask, subkey, obs_wrapper)
+    action, action_probs = policy(current_obs, state.legal_action_mask, subkey)
     next_state = step(state, action, keys)  # pgx specifically, need to rewrite for other types of environments (especially non-jax ones)
     next_obs = next_state.observation
     rewards = next_state.rewards
@@ -118,4 +125,5 @@ class ToInt(ObservationWrapper):
 TODO
 Add GAE and loss functions/gradients
 Note to self, there is still an issue that the shape is like (timesteps, batch_size, w, h, channels)
+Move policy_fn out of MLP, can do it in a separate policy class maybe but at least not in MLP (might be better as a nested function)
 """
