@@ -1,0 +1,155 @@
+import jax
+import jax.numpy as jnp
+import equinox as eqx
+import optax
+from typing import Callable
+from abc import ABC
+
+key = jax.random.key(0)
+
+class Trajectory(eqx.Module):
+    observations: jax.Array
+    actions: jax.Array
+    action_probs: jax.Array
+    rewards: jax.Array
+    dones: jax.Array
+
+class MLP(eqx.Module):
+    input_layer: eqx.Module
+    hiddens: list
+    output_layer: eqx.Module
+    act: Callable
+    skip_connections: bool
+    output_act: Callable
+    
+    def __init__(self, input_dim, output_dim, key, hidden_dim=256, num_hiddens=3, act=jax.nn.selu, hidden_dims=None, output_act=None):
+        # Can specify hidden_dims if want more precise control, but generally keeping them the same should be "good enough," we also
+        # assume that if there aren't specified hidden dims, that we can use skip connections
+        if hidden_dims is not None:
+            assert len(hidden_dims) + 1 == num_hiddens
+            hidden_dim = hidden_dims[0]
+            self.skip_connections = False
+        else:
+            self.skip_connections = True
+        key, subkey = jax.random.split(key)
+        self.input_layer = eqx.nn.Linear(input_dim, hidden_dim, key=subkey)
+        self.hiddens = []
+        for i in range(num_hiddens):
+            key, subkey = jax.random.split(key)
+            if hidden_dims is None:
+                self.hiddens.append(eqx.nn.Linear(hidden_dim, hidden_dim, key=subkey))
+            else:
+                self.hiddens.append(eqx.nn.Linear(hidden_dim, hidden_dims[i + 1], key=subkey))
+                hidden_dim = hidden_dims[i + 1]
+        self.output_layer = eqx.nn.Linear(hidden_dim, output_dim, key=key)
+        self.act = act
+        self.output_act = output_act
+    
+    def __call__(self, x):
+        x = self.act(self.input_layer(x))
+        for i in range(len(self.hiddens)):
+            if self.skip_connections:
+                x = self.act(self.hiddens[i](x)) + x
+            else:
+                x = self.act(self.hiddens[i](x))
+        logits = self.output_layer(x)
+        if self.output_act is not None:
+            return self.output_act(logits)
+        return logits
+    
+def make_policy_fn(model, obs_wrapper=None):
+    def policy_fn(x, legal_action_mask, key):
+        if obs_wrapper is not None:
+            x = obs_wrapper(x)
+        action_logits = jax.vmap(model)(x)
+        action_logits = jnp.where(legal_action_mask, action_logits, -jnp.inf)
+        actions = jax.random.categorical(key, action_logits) 
+        action_dist = jax.nn.softmax(action_logits)
+        action_probs = jnp.take_along_axis(action_dist, jnp.expand_dims(actions, 1), axis=1)
+        return actions, action_probs
+    return policy_fn
+
+def make_value_fn(model, obs_wrapper=None):
+    def value_fn(x):
+        if obs_wrapper is not None:
+            x = obs_wrapper(x)
+        values = jax.vmap(model)(x)
+        return values
+    return value_fn
+
+def collect_trajectory(step, state, current_obs, policy, key, num_timesteps):
+    # slightly inspired by the brax code, but just trying to implement from memory to learn
+    @jax.jit
+    def f(carry, _):
+        state, current_obs, key = carry
+        random_key, key = jax.random.split(key)
+        next_state, next_obs, trajectory = single_step(step, state, current_obs, policy, random_key)
+        return (next_state, next_obs, key), trajectory
+    
+    (next_state, final_obs, _), trajectory = jax.lax.scan(f, (state, current_obs, key), (), num_timesteps) # note to self that scan returns ys in a stacked way.
+    return next_state, final_obs, trajectory
+
+def single_step(step, state, current_obs, policy, key):
+    key, subkey = jax.random.split(key)
+    batch_size = current_obs.shape[0]
+    keys = jax.random.split(subkey, batch_size)
+    action, action_prob = policy(current_obs, state.legal_action_mask, subkey)
+    next_state = step(state, action, keys)  # pgx specifically, need to rewrite for other types of environments (especially non-jax ones)
+    next_obs = next_state.observation
+    rewards = next_state.rewards
+    terminated = next_state.terminated
+    truncated = next_state.truncated
+    dones = jnp.bitwise_or(truncated, terminated)  # Probably a better way to handle this but this should suffice for now
+    traj = Trajectory(current_obs, action, action_prob, rewards, dones)
+    return next_state, next_obs, traj
+
+def generalized_advantage_estimate(value_fn, observations, rewards, dones, gamma, _lambda):
+    # assume observations include s_t-s_t+l (so both initial and the final obs)
+    # delta_t = r_t + gamma * v_t+1 - v_t
+    # A_t = delta_t + gamma * lambda * A_t+1
+    values = value_fn(observations)
+    values_t = values[:-1]
+    values_t_p1 = values[1:]
+    deltas = rewards + values_t_p1 * gamma - values_t
+    def f(a_t_p1, xs):
+        delta, done = xs
+        a_t = a_t_p1 + gamma * _lambda * delta * done
+        return a_t, a_t
+    
+    a_init = jnp.zeros(values.shape[0])
+    advantages = jax.lax.scan(f, a_init, (deltas, dones), reverse=True)
+    
+    return advantages
+        
+    
+    
+
+class ObservationWrapper(ABC):
+    nested_wrapper: Callable
+    def __init__(self, nested_wrapper=None):
+        self.nested_wrapper = nested_wrapper
+        
+    def __call__(self, observation):
+        return observation
+    
+class FlattenObservation(ObservationWrapper):
+    def __call__(self, observation):
+        # Assume that the first dimension is the batch dimension (should generally be correct)
+        if self.nested_wrapper is not None:
+            observation = self.nested_wrapper(observation)
+        batch_shape = observation.shape[0]
+        return observation.reshape(batch_shape, -1)
+    
+class ToInt(ObservationWrapper):
+    def __call__(self, observation):
+        if self.nested_wrapper is not None:
+            observation = self.nested_wrapper(observation)
+        return jnp.astype(observation, int)
+        
+
+"""
+TODO
+Add GAE and loss functions/gradients
+Note to self, there is still an issue that the shape is like (timesteps, batch_size, w, h, channels)
+Need to handle reseting the environment automatically (wrapper maybe).
+"""
