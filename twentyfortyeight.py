@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 import equinox as eqx
 import optax
-from typing import Callable, Type
+from typing import Callable
 from abc import ABC
 import tensorflow_probability as tfp
 
@@ -16,6 +16,17 @@ class Trajectory(eqx.Module):
     rewards: jax.Array
     dones: jax.Array
     mask: jax.Array
+
+class ObservationWrapper(ABC):
+    # Two ways to handle these, pass it into the ppo network and process every time it's called (slower)
+    # Or run it on the step function outputs, is probably fine for PPO but could lead to storage issues 
+    # for things like off-policy learning.
+    nested_wrapper: Callable
+    def __init__(self, nested_wrapper=None):
+        self.nested_wrapper = nested_wrapper
+        
+    def __call__(self, observation):
+        return observation
 
 class MLP(eqx.Module):
     input_layer: eqx.Module
@@ -59,15 +70,6 @@ class MLP(eqx.Module):
         if self.output_act is not None:
             return self.output_act(logits)
         return logits
-
-
-class ObservationWrapper(ABC):
-    nested_wrapper: Callable
-    def __init__(self, nested_wrapper=None):
-        self.nested_wrapper = nested_wrapper
-        
-    def __call__(self, observation):
-        return observation
     
 class PPONetwork(eqx.Module):
     policy_network: MLP
@@ -85,40 +87,43 @@ class PPONetwork(eqx.Module):
                                   num_hiddens=num_hiddens, act=act, hidden_dims=hidden_dims)
         self.obs_wrapper = observation_wrapper
     
-    def policy_forward(self, x, axes=0):
+    def policy_forward(self, x):
         if self.obs_wrapper is not None:
             x = self.obs_wrapper(x)
         action_logits = jax.vmap(self.policy_network)(x)
         return action_logits
     
-def make_policy_fn(model, obs_wrapper=None):
+    def value_forward(self, x):
+        if self.obs_wrapper is not None:
+            x = self.obs_wrapper(x)
+        action_logits = jax.vmap(self.value_network)(x)
+        return action_logits
+    
+def make_policy_fn(model):
+    @jax.jit
     def policy_fn(x, legal_action_mask, key):
-        if obs_wrapper is not None:
-            x = obs_wrapper(x)
-        action_logits = jax.vmap(model)(x)
+        action_logits = model(x)
         action_logits = jnp.where(legal_action_mask, action_logits, -jnp.inf)
         action_dist = jax.nn.softmax(action_logits)
-        # action_dist = tfd.Categorical()
         actions = jax.random.categorical(key, action_logits)
         action_probs = jnp.take_along_axis(action_dist, jnp.expand_dims(actions, 1), axis=1)
         return actions, action_probs, action_dist
     return policy_fn
 
-def make_value_fn(model, obs_wrapper=None):
+def make_value_fn(model):
+    @jax.jit
     def value_fn(x):
-        if obs_wrapper is not None:
-            x = obs_wrapper(x)
-        values = jax.vmap(model)(x)
+        values = model(x)
         return values
     return value_fn
 
-def collect_trajectory(step, state, current_obs, policy_fn, key, num_timesteps):
+def collect_trajectory(step, state, current_obs, policy_fn, key, num_timesteps, obs_wrapper=None):
     # slightly inspired by the brax code, but just trying to implement from memory to learn
-    @jax.jit
+    # @jax.jit
     def f(carry, _):
         state, current_obs, key = carry
         random_key, key = jax.random.split(key)
-        next_state, next_obs, trajectory = single_step(step, state, current_obs, policy_fn, random_key)
+        next_state, next_obs, trajectory = single_step(step, state, current_obs, policy_fn, random_key, obs_wrapper=obs_wrapper)
         return (next_state, next_obs, key), trajectory
     
     (next_state, final_obs, _), trajectory = jax.lax.scan(
@@ -127,10 +132,13 @@ def collect_trajectory(step, state, current_obs, policy_fn, key, num_timesteps):
     # try to stack final obs into the trajectory, not sure if possible but worth a try
     return next_state, final_obs, trajectory
 
-def single_step(step, state, current_obs, policy_fn, key):
+def single_step(step, state, current_obs, policy_fn, key, obs_wrapper=None):
     key, subkey = jax.random.split(key)
     batch_size = current_obs.shape[0]
     keys = jax.random.split(subkey, batch_size)
+    if obs_wrapper is not None:
+        current_obs = obs_wrapper(current_obs)
+    key, subkey = jax.random.split(key)
     action, action_prob, _ = policy_fn(current_obs, state.legal_action_mask, subkey)
     next_state = step(state, action, keys)  # pgx specifically, need to rewrite for other types of environments (especially non-jax ones)
     next_obs = next_state.observation
@@ -141,7 +149,7 @@ def single_step(step, state, current_obs, policy_fn, key):
     traj = Trajectory(current_obs, action, action_prob, rewards, dones, state.legal_action_mask)
     return next_state, next_obs, traj
 
-@jax.jit
+# @jax.jit
 def generalized_advantage_estimate(values, rewards, dones, discount, _lambda):
     # Also heavily inspired by brax implementation
     # assume observations include s_t-s_t+l (so both initial and the final obs) 
@@ -153,7 +161,7 @@ def generalized_advantage_estimate(values, rewards, dones, discount, _lambda):
     def f(carry, xs):
         delta, done = xs
         a_t_p1, _ = carry
-        a_t = delta + a_t_p1 * _lambda * discount * done
+        a_t = delta + a_t_p1 * _lambda * discount * (1 - done)
         return (a_t, _), (a_t)
     
     a_init = (jnp.zeros((values.shape[1], 1)), None)
@@ -162,11 +170,11 @@ def generalized_advantage_estimate(values, rewards, dones, discount, _lambda):
     vs = gae + values_t
     vs_t_p1 = jnp.concatenate([vs[1:], jnp.expand_dims(values[-1], 0)])
     
-    advantages = dones * (rewards + discount * vs_t_p1 - vs)
+    advantages = (1 - dones) * (rewards + discount * vs_t_p1 - vs)
     
     return jax.lax.stop_gradient(advantages), jax.lax.stop_gradient(vs)
 
-def ppo_loss(trajectory, final_obs, policy_fn, value_fn, discount, _lambda, eps, value_loss_coeff, entropy_loss_coeff):
+def ppo_loss(trajectory, final_obs, ppo_network, value_fn, discount, _lambda, eps, value_loss_coeff, entropy_loss_coeff):
     # Value loss: L = (r_t + gamma * V(s_t+1) - V(s_t)) ^ 2
     # R_ratio = pi_theta(a_t|s_t) / pi_old(a_t | s_t)
     # Policy loss = min(R_ratio * advantage, clip(R_ratio, 1-eps, 1+eps) * advantage)
@@ -181,7 +189,9 @@ def ppo_loss(trajectory, final_obs, policy_fn, value_fn, discount, _lambda, eps,
     observations = combine_dims(observations)
     mask = combine_dims(mask)
     actions = combine_dims(actions)
-    _, _, action_dist = policy_fn(observations, mask, jax.random.key(0))
+    action_logits = ppo_network.policy_forward(observations)
+    action_logits = jnp.where(mask, action_logits, -jnp.inf)
+    action_dist = jax.nn.softmax(action_logits)
     new_action_probs = jnp.take_along_axis(action_dist, jnp.expand_dims(actions, 1), axis=1)
     new_action_probs = jnp.reshape(new_action_probs, (timesteps, batch_size, -1))
     
@@ -198,7 +208,7 @@ def ppo_loss(trajectory, final_obs, policy_fn, value_fn, discount, _lambda, eps,
                                         jnp.clip(policy_ratio, 1-eps, 1+eps) * advantages))
     
     # TODO Entropy loss
-    entropy_loss = -jnp.mean(jnp.sum(action_dist * jnp.log(action_dist + 1e-10), axis=-1))
+    entropy_loss = jnp.mean(jnp.sum(action_dist * jnp.log(action_dist + 1e-10), axis=-1))
     total_loss = value_loss * value_loss_coeff + policy_loss + entropy_loss * entropy_loss_coeff
     metrics = {
         "value_loss": value_loss,
@@ -212,8 +222,7 @@ class FlattenObservation(ObservationWrapper):
         # Assume that the first dimension is the batch dimension (should generally be correct)
         if self.nested_wrapper is not None:
             observation = self.nested_wrapper(observation)
-        batch_shape = observation.shape[0]
-        return observation.reshape(batch_shape, -1)
+        return jax.lax.collapse(observation, 1)
     
 class ToInt(ObservationWrapper):
     def __call__(self, observation):
