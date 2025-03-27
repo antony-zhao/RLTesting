@@ -4,9 +4,7 @@ import equinox as eqx
 import optax
 from typing import Callable
 from abc import ABC
-import tensorflow_probability as tfp
 
-tfd = tfp.distributions
 combine_dims = lambda x: jax.lax.collapse(x, 0, 2)
 
 class Trajectory(eqx.Module):
@@ -35,6 +33,7 @@ class MLP(eqx.Module):
     act: Callable
     skip_connections: bool
     output_act: Callable
+    forward: Callable
     
     def __init__(self, input_dim, output_dim, key, hidden_dim=256, num_hiddens=3, act=jax.nn.selu, hidden_dims=None, output_act=None):
         # Can specify hidden_dims if want more precise control, but generally keeping them the same should be "good enough," we also
@@ -58,18 +57,21 @@ class MLP(eqx.Module):
         self.output_layer = eqx.nn.Linear(hidden_dim, output_dim, key=key)
         self.act = act
         self.output_act = output_act
+        def f(x):
+            x = self.act(self.input_layer(x))
+            for i in range(len(self.hiddens)):
+                if self.skip_connections:
+                    x = self.act(self.hiddens[i](x)) + x
+                else:
+                    x = self.act(self.hiddens[i](x))
+            logits = self.output_layer(x)
+            if self.output_act is not None:
+                return self.output_act(logits)
+            return logits
+        self.forward = eqx.filter_jit(f)
     
     def __call__(self, x):
-        x = self.act(self.input_layer(x))
-        for i in range(len(self.hiddens)):
-            if self.skip_connections:
-                x = self.act(self.hiddens[i](x)) + x
-            else:
-                x = self.act(self.hiddens[i](x))
-        logits = self.output_layer(x)
-        if self.output_act is not None:
-            return self.output_act(logits)
-        return logits
+        return self.forward(x)
     
 class PPONetwork(eqx.Module):
     policy_network: MLP
@@ -218,6 +220,7 @@ def ppo_loss(trajectory, final_obs, ppo_network, value_fn, discount, _lambda, ep
     return total_loss, metrics
     
 class FlattenObservation(ObservationWrapper):
+    @jax.jit
     def __call__(self, observation):
         # Assume that the first dimension is the batch dimension (should generally be correct)
         if self.nested_wrapper is not None:
@@ -225,6 +228,7 @@ class FlattenObservation(ObservationWrapper):
         return jax.lax.collapse(observation, 1)
     
 class ToInt(ObservationWrapper):
+    @jax.jit
     def __call__(self, observation):
         if self.nested_wrapper is not None:
             observation = self.nested_wrapper(observation)
