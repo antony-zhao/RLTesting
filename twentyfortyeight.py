@@ -110,7 +110,6 @@ class PPONetwork(eqx.Module):
         action_logits = jax.vmap(self.value_network)(x)
         return action_logits
     
-    @eqx.filter_jit
     def policy_fn(self, x, legal_action_mask, key):
         action_logits = self.policy_forward(x)
         action_logits = jnp.where(legal_action_mask, action_logits, -jnp.inf)
@@ -136,6 +135,7 @@ def collect_trajectory(ppo_network, step, state, current_obs, key, num_timesteps
         final_obs = obs_wrapper(final_obs)
     return next_state, final_obs, trajectory
 
+@eqx.filter_jit
 def single_step(step, state, current_obs, policy_fn, key, obs_wrapper=None):
     key, subkey = jax.random.split(key)
     batch_size = current_obs.shape[0]
@@ -172,11 +172,8 @@ def generalized_advantage_estimate(values, rewards, dones, discount, lambda_):
     a_init = jnp.zeros((values.shape[1], 1))
     _, gae = jax.lax.scan(f, (a_init, None), (deltas, dones), reverse=True)
     value_target = gae + values_t
-    vs_t_p1 = jnp.concatenate([value_target[1:], jnp.expand_dims(values[-1], 0)])
-    
-    advantages = (1 - dones) * (rewards + discount * vs_t_p1 - values_t)
-    
-    return advantages, value_target
+            
+    return gae, value_target
 
 @eqx.filter_jit
 def ppo_loss(ppo_network, trajectory, final_obs, discount, lambda_, eps, value_loss_coeff, entropy_loss_coeff):
@@ -185,7 +182,7 @@ def ppo_loss(ppo_network, trajectory, final_obs, discount, lambda_, eps, value_l
     # Policy loss = min(R_ratio * advantage, clip(R_ratio, 1-eps, 1+eps) * advantage)
     observations, rewards, dones, actions, mask = trajectory.observations, trajectory.rewards, \
         trajectory.dones, trajectory.actions, trajectory.mask
-    # rewards = jnp.sign(rewards) * (jnp.sqrt(rewards + 1) - 1 + 0.001 * rewards)
+    rewards = jnp.sign(rewards) * (jnp.sqrt(rewards + 1) - 1 + 0.001 * rewards)
     timesteps, batch_size = observations.shape[:2]
     all_observations = jnp.concatenate([observations, jnp.expand_dims(final_obs, 0)]) 
     old_action_probs = trajectory.action_probs
@@ -244,7 +241,6 @@ def make_grad_step(model, loss_fn, optim, key, num_minibatches):
         final_obs = jnp.reshape(final_obs, (num_minibatches, -1) + final_obs.shape[1:])
         
         arr, static = eqx.partition(model, eqx.is_array)
-        @eqx.filter_jit
         def f(carry, data):
             arr, opt_state = carry
             model = eqx.combine(arr, static)
@@ -256,18 +252,7 @@ def make_grad_step(model, loss_fn, optim, key, num_minibatches):
             model = eqx.apply_updates(model, updates)
             arr, _ = eqx.partition(model, eqx.is_array)
             return (arr, opt_state), loss_out
-        # def f(i, model, opt_state):
-        #     mini_traj = Trajectory(trajectory.observations[i], trajectory.actions[i], trajectory.action_probs[i], trajectory.rewards[i], trajectory.dones[i], trajectory.mask[i])
-        #     final = final_obs[i]
-        #     loss_out, grads = eqx.filter_value_and_grad(loss_fn, allow_int=True, has_aux=True)(ppo_network, mini_traj, final, discount, lambda_, eps, value_loss_coeff, entropy_loss_coeff)
-        #     updates, opt_state = optim.update(
-        #         grads, opt_state, eqx.filter(model, eqx.is_array)
-        #     )
-        #     model = eqx.apply_updates(model, updates)
-        #     return (model, opt_state), loss_out
         
-        # for i in range(num_minibatches):
-        #     (model, opt_state), loss_out = f(i, model, opt_state)
         (arr, opt_state), loss_out = jax.lax.scan(f, (arr, opt_state), (trajectory, final_obs))
         model = eqx.combine(arr, static)
         loss_out = jax.tree_util.tree_map(jnp.mean, loss_out)
