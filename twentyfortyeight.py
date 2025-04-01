@@ -5,9 +5,10 @@ import optax
 from typing import Callable
 from abc import ABC
 import pgx
-from pgx.experimental import auto_reset
+from pgx.experimental import auto_reset, act_randomly
 from matplotlib import pyplot as plt
 from distreqx.distributions.categorical import Categorical
+import copy
 
 combine_dims = lambda x: jax.lax.collapse(x, 0, 2)
 
@@ -82,20 +83,52 @@ class MLP(eqx.Module):
             return self.output_act(logits)
         return logits
     
+class Conv2048(eqx.Module):
+    # essentially just a bunch of residual 2x2 blocks
+    input_layer: eqx.Module
+    output_layer: eqx.Module
+    layers: list[eqx.Module]
+    act: Callable
+    output_dim: int
+    
+    def __init__(self, key, num_convs=5, act=jax.nn.selu, channels=128):
+        self.act = act
+        self.layers = []
+        key, subkey = jax.random.split(key)
+        self.input_layer = eqx.nn.Conv2d(31, channels, 3, 1, padding='same', key=subkey)
+        for _ in range(num_convs):
+            key, subkey = jax.random.split(key)
+            self.layers.append(eqx.nn.Conv2d(channels, channels, 2, 1, padding='same', key=subkey))
+        key, subkey = jax.random.split(key)
+        self.output_layer = eqx.nn.Conv2d(channels, channels, 2, 2, padding='same', key=subkey)
+        self.output_dim = channels * 4
+        
+    @eqx.filter_jit
+    def __call__(self, x):
+        x = x_skip = self.act(self.input_layer(x))
+        for i in range(len(self.layers)):
+            x = x_skip = self.act(self.layers[i](x)) + x_skip
+        x = self.act(self.output_layer(x))
+        return x.flatten()
+
+class ConvNetwork(eqx.Module):
+    conv: eqx.Module
+    mlp: eqx.Module
+    
+    @eqx.filter_jit
+    def __call__(self, x):
+        x = self.conv(x)
+        return self.mlp(x)
+        
+
 class PPONetwork(eqx.Module):
     policy_network: MLP
     value_network: MLP
     obs_wrapper: ObservationWrapper
     
-    def __init__(self, input_dim, num_actions, key, hidden_dim=256, 
-                 num_hiddens=3, act=jax.nn.selu, hidden_dims=None, obs_wrapper=None):
-        # Assuming we have the same general MLP structure for both the policy network and value network
-        # Potentially TODO: Support better arg handling for different structures for both models
-        key, subkey1, subkey2 = jax.random.split(key, 3)
-        self.policy_network = MLP(input_dim, num_actions, subkey1, hidden_dim=hidden_dim, 
-                                  num_hiddens=num_hiddens, act=act, hidden_dims=hidden_dims)
-        self.value_network = MLP(input_dim, 1, subkey2, hidden_dim=hidden_dim, 
-                                  num_hiddens=num_hiddens, act=act, hidden_dims=hidden_dims)
+    def __init__(self, policy_network, value_network, obs_wrapper=None):
+        self.policy_network = policy_network
+        self.value_network = value_network
         self.obs_wrapper = obs_wrapper
     
     def policy_forward(self, x):
@@ -110,12 +143,16 @@ class PPONetwork(eqx.Module):
         action_logits = jax.vmap(self.value_network)(x)
         return action_logits
     
-    def policy_fn(self, x, legal_action_mask, key):
+    @eqx.filter_jit
+    def policy_fn(self, x, legal_action_mask, key, deterministic=False):
         action_logits = self.policy_forward(x)
         action_logits = jnp.where(legal_action_mask, action_logits, -jnp.inf)
-        actions_dist = Categorical(action_logits)
-        actions = actions_dist.sample(key)
-        action_probs = actions_dist.log_prob(actions)
+        if deterministic:
+            return jnp.argmax(action_logits, -1), None
+        else:
+            actions_dist = Categorical(action_logits)
+            actions = actions_dist.sample(key)
+            action_probs = actions_dist.log_prob(actions)
         return actions.astype(jnp.int32), action_probs
 
 @eqx.filter_jit
@@ -258,6 +295,42 @@ def make_grad_step(model, loss_fn, optim, key, num_minibatches):
         loss_out = jax.tree_util.tree_map(jnp.mean, loss_out)
         return loss_out, model
     return grad_step
+
+def make_eval_step(eval_init, eval_step_fn, eval_batch_size, obs_wrapper=None):
+    def eval_step(ppo_network, key):
+        key, subkey = jax.random.split(key)
+        keys = jax.random.split(subkey, eval_batch_size)
+
+        eval_state = eval_init(keys)
+        rewards = 0
+        timesteps = 0
+
+        def cond_fn(carry):
+            eval_state, _, _, _ = carry
+            return jnp.logical_not((eval_state.terminated | eval_state.truncated).all())
+        
+        def body_fn(carry):
+            eval_state, rewards, timesteps, key = carry
+            key, subkey, subkey2 = jax.random.split(key, 3)
+            
+            if obs_wrapper is not None:
+                action, _ = ppo_network.policy_fn(obs_wrapper(eval_state.observation), eval_state.legal_action_mask, subkey, deterministic=True)
+            else:
+                action, _ = ppo_network.policy_fn(eval_state.observation, eval_state.legal_action_mask, subkey, deterministic=True)
+            
+            keys = jax.random.split(subkey2, eval_batch_size)
+            eval_state = eval_step_fn(eval_state, action, keys)
+            rewards += jnp.mean(eval_state.rewards)
+            timesteps += 1
+            
+            return eval_state, rewards, timesteps, key
+        
+        carry = (eval_state, 0, 0, key)
+        
+        eval_state, rewards, timesteps, _ = jax.lax.while_loop(cond_fn, body_fn, carry)
+        
+        return rewards, timesteps
+    return eval_step
     
 class FlattenObservation(ObservationWrapper):
     def __init__(self, nested_wrapper=None):
@@ -271,10 +344,22 @@ class FlattenObservation(ObservationWrapper):
             observation = self.nested_wrapper(observation)
         return self.f(observation)
     
-class ToInt(ObservationWrapper):
-    def __init__(self, nested_wrapper=None):
+class TransposeObservation(ObservationWrapper):
+    def __init__(self, axes, nested_wrapper=None):
         self.nested_wrapper = nested_wrapper
-        f = lambda x: jnp.astype(x, int)
+        f = lambda x: jnp.transpose(x, axes)
+        self.f = jax.jit(jax.vmap(f))
+        
+    def __call__(self, observation):
+        # Assume that the first dimension is the batch dimension (should generally be correct)
+        if self.nested_wrapper is not None:
+            observation = self.nested_wrapper(observation)
+        return self.f(observation)
+    
+class ToDtype(ObservationWrapper):
+    def __init__(self, dtype, nested_wrapper=None):
+        self.nested_wrapper = nested_wrapper
+        f = lambda x: jnp.astype(x, dtype)
         self.f = jax.jit(f)
         
     def __call__(self, observation):
