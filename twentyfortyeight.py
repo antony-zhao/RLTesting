@@ -296,8 +296,10 @@ def make_grad_step(model, loss_fn, optim, key, num_minibatches):
         return loss_out, model
     return grad_step
 
-def make_eval_step(eval_init, eval_step_fn, eval_batch_size, obs_wrapper=None):
-    def eval_step(ppo_network, key):
+def make_eval_step(eval_init, eval_step_fn, eval_batch_size, key, obs_wrapper=None):
+    @eqx.filter_jit
+    def eval_step(ppo_network):
+        nonlocal key
         key, subkey = jax.random.split(key)
         keys = jax.random.split(subkey, eval_batch_size)
 
