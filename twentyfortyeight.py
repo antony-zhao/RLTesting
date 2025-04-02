@@ -5,10 +5,9 @@ import optax
 from typing import Callable
 from abc import ABC
 import pgx
-from pgx.experimental import auto_reset, act_randomly
+from pgx.experimental import auto_reset
 from matplotlib import pyplot as plt
 from distreqx.distributions.categorical import Categorical
-import copy
 
 combine_dims = lambda x: jax.lax.collapse(x, 0, 2)
 
@@ -297,7 +296,7 @@ def make_grad_step(model, loss_fn, optim, key, num_minibatches):
     return grad_step
 
 def make_eval_step(eval_init, eval_step_fn, eval_batch_size, key, obs_wrapper=None):
-    @eqx.filter_jit
+    @eqx.filter_jit 
     def eval_step(ppo_network):
         nonlocal key
         key, subkey = jax.random.split(key)
@@ -381,52 +380,123 @@ class _2048Reward(RewardWrapper):
         return self.f(reward)
 
 def main(args):
-    env = pgx.make("2048")
-    
+    import numpy as np
+    env_id = "2048"
+    env = pgx.make(env_id)
+    batch_size = args.num_envs
+    eval_batch_size = args.num_eval_envs
+
     init = jax.jit(jax.vmap(env.init))
-    step = jax.jit(jax.vmap(auto_reset(env.step, env.init)))
-    
+    step_fn = jax.jit(jax.vmap(auto_reset(env.step, env.init)))
+    eval_init = jax.jit(jax.vmap(env.init))
+    eval_step_fn = jax.jit(jax.vmap(env.step))
+
     key = jax.random.key(args.seed)
     key, subkey = jax.random.split(key)
-    keys = jax.random.split(subkey, args.num_envs)
+    keys = jax.random.split(subkey, batch_size)
     
-    state = init(keys)
-    
-    obs_wrapper = ToInt(FlattenObservation())
-    ppo_network = PPONetwork(496, 4, key, obs_wrapper=obs_wrapper)
-    optim = optax.adamw(args.lr)
+    timesteps = args.rollout_length
+    minibatches = args.num_minibatches
+    epochs = args.epochs
+    eval_every = args.eval_every
+
+    obs_wrapper = ToDtype(float, TransposeObservation((2, 0, 1)))
+
+    key, subkey1, subkey2 = jax.random.split(key, 3)
+    conv1 = Conv2048(subkey1)
+    policy_network = ConvNetwork(conv1, MLP(conv1.output_dim, 4, subkey2))
+    key, subkey1, subkey2 = jax.random.split(key, 3)
+    conv2 = Conv2048(subkey1)
+    value_network = ConvNetwork(conv2, MLP(conv2.output_dim, 1, subkey2))
+    ppo_network = PPONetwork(policy_network, value_network)
+
     key, subkey = jax.random.split(key)
-    grad_step = make_grad_step(ppo_network, ppo_loss, optim, subkey, args.num_minibatches)
+    eval_step = make_eval_step(eval_init, eval_step_fn, eval_batch_size, subkey, obs_wrapper)
+    state = init(keys)
+    state, _, _ = collect_trajectory(ppo_network, step_fn, state, state.observation, key, args.init_steps, obs_wrapper=obs_wrapper)
+    key, subkey = jax.random.split(key)
+    optim = optax.chain(optax.clip_by_global_norm(args.max_grad_norm), optax.adamw(args.lr))
+    grad_step = make_grad_step(ppo_network, ppo_loss, optim, subkey, minibatches)
     
     losses = []
     policy_losses = []
-    rewards = []
-    for i in range(1000):
-        state, _, traj = collect_trajectory(ppo_network, step, state, state.observation, key, args.rollout_length)
-        key, subkey = jax.random.split(key)
-        (loss, metrics), ppo_network = grad_step(ppo_network, traj, state.observation, args.discount, args.lambda_, 0.2, 1, 0.01)
-        losses.append(loss)
-        policy_losses.append(metrics['policy_loss'])
-        rewards.append(jnp.mean(traj.rewards))
-        
-    plt.plot(losses)
-    plt.show()
-    plt.plot(rewards)
-    plt.show()
-    plt.plot(policy_losses)
+    entropy_losses = []
+    train_rewards = []
+    eval_rewards = []
+    eval_timesteps = []
+    for i in range(epochs + 1):
+        if i % eval_every == 0:
+            eval_reward, eval_length = eval_step(ppo_network)
+            print(f"epoch {i}: reward: {eval_reward}, episode length: {eval_length}")
+            eval_rewards.append(eval_reward)
+            eval_timesteps.append(eval_length)
+        state, final_obs, traj = collect_trajectory(ppo_network, step_fn, state, state.observation, key, timesteps, obs_wrapper=obs_wrapper)
+        (loss, metrics), ppo_network = grad_step(ppo_network, traj, final_obs, args.discount, args.lambda_, args.clip, args.val_coef, args.ent_coef)
+        losses.append(np.array(loss))
+        policy_losses.append(np.array(metrics['policy_loss']))
+        entropy_losses.append(np.array(metrics['entropy_loss']))
+        train_rewards.append(np.array(jnp.sum(traj.rewards) / jnp.sum(traj.dones)))
+
+    fig, axs = plt.subplots(2, 3)
+    fig.set_figwidth(20)
+    fig.set_figheight(10)
+    axs[0, 0].plot(losses)
+    axs[0, 0].set_title("Overall Loss")
+    axs[0, 1].plot(entropy_losses)
+    axs[0, 1].set_title("Entropy Loss")
+    axs[0, 2].plot(policy_losses)
+    axs[0, 2].set_title("Policy Loss")
+    axs[1, 0].plot(train_rewards)
+    axs[1, 0].set_title("Train Reward")
+    eval_axis = np.arange(len(eval_rewards)) * eval_every
+    axs[1, 1].plot(eval_axis, eval_rewards)
+    axs[1, 1].set_title("Eval Reward")
+    axs[1, 2].plot(eval_axis, eval_timesteps)
+    axs[1, 2].set_title("Eval Episode Length")
+    fig.savefig(f"{env_id}_plot.png")
     print(metrics)
+    
+    render_batch_size = 4
+
+    render_step_fn = jax.jit(jax.vmap(env.step))
+
+    key, subkey = jax.random.split(key)
+    keys = jax.random.split(subkey, render_batch_size)
+
+    states = []
+    state = init(keys)
+    states.append(state)
+    entropy_losses = 0
+
+    while not (state.terminated | state.truncated).all():
+        key, subkey, subkey2 = jax.random.split(key, 3)
+        action, _ = ppo_network.policy_fn(obs_wrapper(state.observation), state.legal_action_mask, subkey, True)
+        keys = jax.random.split(subkey2, render_batch_size)
+        state = render_step_fn(state, action, keys)
+        states.append(state)
+        entropy_losses += jnp.mean(state.rewards)
+        
+    print('saving animation')
+    pgx.save_svg_animation(states, f"{env_id}.svg", frame_duration_seconds=0.05)
 
 if __name__ == '__main__':
     from argparse import ArgumentParser
     parser = ArgumentParser()
     parser.add_argument('--discount', type=float, default=0.99)
     parser.add_argument('--lambda_', type=float, default=0.95)
-    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--clip', type=float, default=0.2)
-    parser.add_argument('--rollout_length', type=int, default=16)
-    parser.add_argument('--num_envs', type=int, default=4096)
-    parser.add_argument('--num_minibatches', type=int, default=32)
+    parser.add_argument('--val_coef', type=float, default=1)
+    parser.add_argument('--ent_coef', type=float, default=0.001)
+    parser.add_argument('--max_grad_norm', type=float, default=0.5)
+    parser.add_argument('--rollout_length', type=int, default=32)
+    parser.add_argument('--num_envs', type=int, default=8192)
+    parser.add_argument('--num_eval_envs', type=int, default=128)
+    parser.add_argument('--num_minibatches', type=int, default=256)
     parser.add_argument('--seed', type=int, default=0)
-    parser.add_argument('--timesteps', type=int, default=1000)
+    parser.add_argument('--epochs', type=int, default=100000)
+    parser.add_argument('--eval_every', type=int, default=100)
+    parser.add_argument('--init_steps', type=int, default=100)
     args = parser.parse_args()
     main(args)
+    
