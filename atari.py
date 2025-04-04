@@ -81,6 +81,11 @@ class AtariConv(nn.Module):
 class ICM:
     pass
 
+
+def sac_loss(observations, actions, rewards, next_observations, dones):
+    pass
+
+
 def main(args):
     env = make_atari_env(args.env + '-v5', args.num_envs, args.seed)
     torch.random.seed(args.seed)

@@ -8,6 +8,7 @@ import pgx
 from pgx.experimental import auto_reset
 from matplotlib import pyplot as plt
 from distreqx.distributions.categorical import Categorical
+from logger import Logger
 
 combine_dims = lambda x: jax.lax.collapse(x, 0, 2)
 
@@ -381,6 +382,7 @@ class _2048Reward(RewardWrapper):
 
 def main(args):
     import numpy as np
+    import time
     env_id = "2048"
     env = pgx.make(env_id)
     batch_size = args.num_envs
@@ -418,26 +420,40 @@ def main(args):
     optim = optax.chain(optax.clip_by_global_norm(args.max_grad_norm), optax.adamw(args.lr))
     grad_step = make_grad_step(ppo_network, ppo_loss, optim, subkey, minibatches)
     
+    logger = Logger('logs')
     losses = []
+    value_losses = []
     policy_losses = []
     entropy_losses = []
     train_rewards = []
     eval_rewards = []
     eval_timesteps = []
+    start_time = time.time()
     for i in range(epochs + 1):
         if i % eval_every == 0:
             eval_reward, eval_length = eval_step(ppo_network)
             print(f"epoch {i}: reward: {eval_reward}, episode length: {eval_length}")
             eval_rewards.append(eval_reward)
             eval_timesteps.append(eval_length)
+            logger.add_scalar("eval_reward", eval_reward)
+            logger.add_scalar("eval_length", eval_length)
         state, final_obs, traj = collect_trajectory(ppo_network, step_fn, state, state.observation, key, timesteps, obs_wrapper=obs_wrapper)
         (loss, metrics), ppo_network = grad_step(ppo_network, traj, final_obs, args.discount, args.lambda_, args.clip, args.val_coef, args.ent_coef)
         losses.append(np.array(loss))
+        value_losses.append(np.array(metrics['value_loss']))
         policy_losses.append(np.array(metrics['policy_loss']))
         entropy_losses.append(np.array(metrics['entropy_loss']))
         train_rewards.append(np.array(jnp.sum(traj.rewards) / jnp.sum(traj.dones)))
+        logger.add_scalar("loss", np.array(loss))
+        logger.add_scalar("value_loss", np.array(metrics['value_loss']))
+        logger.add_scalar("policy_loss", np.array(metrics['policy_loss']))
+        logger.add_scalar("entropy_loss", np.array(metrics['entropy_loss']))
+        logger.add_scalar("train_reward", np.array(jnp.sum(traj.rewards) / jnp.sum(traj.dones)))
+        logger.write(i)
+        logger.add_scalar("epochs over time", i)
+        logger.write(time.time() - start_time)
 
-    fig, axs = plt.subplots(2, 3)
+    fig, axs = plt.subplots(2, 4)
     fig.set_figwidth(20)
     fig.set_figheight(10)
     axs[0, 0].plot(losses)
@@ -446,6 +462,8 @@ def main(args):
     axs[0, 1].set_title("Entropy Loss")
     axs[0, 2].plot(policy_losses)
     axs[0, 2].set_title("Policy Loss")
+    axs[0, 3].plot(value_losses)
+    axs[0, 3].set_title("Value Loss")
     axs[1, 0].plot(train_rewards)
     axs[1, 0].set_title("Train Reward")
     eval_axis = np.arange(len(eval_rewards)) * eval_every
@@ -484,15 +502,15 @@ if __name__ == '__main__':
     parser = ArgumentParser()
     parser.add_argument('--discount', type=float, default=0.99)
     parser.add_argument('--lambda_', type=float, default=0.95)
-    parser.add_argument('--lr', type=float, default=3e-4)
-    parser.add_argument('--clip', type=float, default=0.2)
+    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--clip', type=float, default=0.1)
     parser.add_argument('--val_coef', type=float, default=1)
     parser.add_argument('--ent_coef', type=float, default=0.001)
-    parser.add_argument('--max_grad_norm', type=float, default=0.5)
-    parser.add_argument('--rollout_length', type=int, default=32)
+    parser.add_argument('--max_grad_norm', type=float, default=0.2)
+    parser.add_argument('--rollout_length', type=int, default=64)
     parser.add_argument('--num_envs', type=int, default=8192)
     parser.add_argument('--num_eval_envs', type=int, default=128)
-    parser.add_argument('--num_minibatches', type=int, default=256)
+    parser.add_argument('--num_minibatches', type=int, default=64)
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--epochs', type=int, default=100000)
     parser.add_argument('--eval_every', type=int, default=100)
