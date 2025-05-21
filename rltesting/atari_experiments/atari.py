@@ -39,7 +39,6 @@ class MLP(nn.Module):
             return self.output_act(logits)
         return logits
 
-
 class ResBlock(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, stride=1, act=nn.SELU):
         super(ResBlock, self).__init__()
@@ -59,7 +58,6 @@ class ResBlock(nn.Module):
             x_skip = self.skip_conv(x_skip)
         return x + x_skip
         
-        
 class AtariConv(nn.Module):
     # assumes the 84x84 grayscale and 4 frame stack
     def __init__(self, act=nn.SELU):
@@ -73,17 +71,79 @@ class AtariConv(nn.Module):
             act, 
             ResBlock(in_channels=128, out_channels=512, kernel_size=3, stride=2, padding='same') # (128, 7, 7) -> (256, 3, 3) or 2304
         ])
+        self.output_dim = 2304
     def forward(self, x):
         x = self.convs(x)
         return x
-    
 
 class ICM:
     pass
 
+class PolicyNetwork(nn.Module):
+    def __init__(self, num_actions):
+        super(PolicyNetwork, self).__init__()
+        self.conv = AtariConv()
+        self.mlp = MLP(self.conv.output_dim, num_actions)
+    
+    def forward(self, x):
+        x = self.conv(x)
+        x = x.view(-1, self.conv.output_dim)
+        x = self.mlp(x)
+        return x
 
-def sac_loss(observations, actions, rewards, next_observations, dones):
-    pass
+class CriticNetwork(nn.Module):
+    def __init__(self, num_actions):
+        super(CriticNetwork, self).__init__()
+        self.conv = AtariConv()
+        self.mlp = MLP(self.conv.output_dim + num_actions, num_actions)
+    
+    def forward(self, x, a):
+        x = self.conv(x)
+        x = x.view(-1, self.conv.output_dim)
+        x = torch.concat([x, a], dim=1)
+        x = self.mlp(x)
+        return x
+
+class SACNetwork(nn.Module):
+    def __init__(self, num_actions, ensemble_size=2, tau=1e-4):
+        super(SACNetwork, self).__init__()
+        self.tau = tau
+        self.ensemble_size = ensemble_size
+        self.policy_network = PolicyNetwork(num_actions)
+        self.critic_networks = [CriticNetwork(num_actions) for _ in range(ensemble_size)]
+        self.target_critics = [CriticNetwork(num_actions) for _ in range(ensemble_size)]
+        for critic_network, target_critic in zip(self.critic_networks, self.target_critics):
+            target_critic.load_state_dict(critic_network.state_dict())
+    
+    def compute_Q(self, obs):
+        return self.critic_network(obs)
+    
+    def compute_target_Q(self, obs):
+        return self.target_critic(obs)
+    
+    def action_dist(self, obs):
+        logits = self.policy_network(obs)
+        action_dist = Categorical(logits=logits)
+        return action_dist
+    
+    def policy_fn(self, obs):
+        # actually choosing the action
+        action_dist = self.action_dist(obs)
+        action = action_dist.sample()
+        return action
+    
+    def update_target(self):
+        for critic_network, target_critic in zip(self.critic_networks, self.target_critics):
+            critic_dict = critic_network.state_dict()
+            target_dict = target_critic.state_dict()
+            for key in critic_dict:
+                target_dict[key] = target_dict[key] * (1 - self.tau) + critic_dict[key] * self.tau
+            target_critic.load_state_dict(target_dict)
+
+def sac_loss(sac_network: SACNetwork, observations, actions, rewards, next_observations, dones):
+    action_dist = sac_network.action_dist(observations)
+    log_prob = action_dist.log_prob(actions)
+    target_Q = sac_network.compute_target_Q(next_observations)
 
 
 def main(args):

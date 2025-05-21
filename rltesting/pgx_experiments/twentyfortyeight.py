@@ -8,11 +8,12 @@ import pgx
 from pgx.experimental import auto_reset
 from matplotlib import pyplot as plt
 from distreqx.distributions.categorical import Categorical
-from logger import Logger
+from utils.logger import Logger
+from utils.jax_utils import init_convnet_weights, orthogonal_init
 
 combine_dims = lambda x: jax.lax.collapse(x, 0, 2)
 
-class Trajectory(eqx.Module):
+class Rollout(eqx.Module):
     observations: jax.Array
     actions: jax.Array
     action_probs: jax.Array
@@ -75,7 +76,7 @@ class MLP(eqx.Module):
         x = self.act(self.input_layer(x))
         for i in range(len(self.hiddens)):
             if self.skip_connections:
-                x = self.act(self.hiddens[i](x))# + x
+                x = self.act(self.hiddens[i](x)) + x
             else:
                 x = self.act(self.hiddens[i](x))
         logits = self.output_layer(x)
@@ -140,8 +141,8 @@ class PPONetwork(eqx.Module):
     def value_forward(self, x):
         if self.obs_wrapper is not None:
             x = self.obs_wrapper(x)
-        action_logits = jax.vmap(self.value_network)(x)
-        return action_logits
+        values = jax.vmap(self.value_network)(x)
+        return values
     
     @eqx.filter_jit
     def policy_fn(self, x, legal_action_mask, key, deterministic=False):
@@ -156,21 +157,21 @@ class PPONetwork(eqx.Module):
         return actions.astype(jnp.int32), action_probs
 
 @eqx.filter_jit
-def collect_trajectory(ppo_network, step, state, current_obs, key, num_timesteps, obs_wrapper=None):
+def collect_rollout(ppo_network, step, state, current_obs, key, num_timesteps, obs_wrapper=None):
     # slightly inspired by the brax code, but just trying to implement from memory to learn
     def f(carry, _):
         state, current_obs, key = carry
         random_key, key = jax.random.split(key)
-        next_state, next_obs, trajectory = single_step(step, state, current_obs, ppo_network.policy_fn, random_key, obs_wrapper=obs_wrapper)
-        return (next_state, next_obs, key), trajectory
+        next_state, next_obs, rollout = single_step(step, state, current_obs, ppo_network.policy_fn, random_key, obs_wrapper=obs_wrapper)
+        return (next_state, next_obs, key), rollout
     
-    (next_state, final_obs, _), trajectory = jax.lax.scan(
+    (next_state, final_obs, _), rollout = jax.lax.scan(
         f, (state, current_obs, key), (), num_timesteps
     ) # note to self that scan returns ys in a stacked way.
-    # try to stack final obs into the trajectory, not sure if possible but worth a try
+    # try to stack final obs into the rollout, not sure if possible but worth a try
     if obs_wrapper is not None:
         final_obs = obs_wrapper(final_obs)
-    return next_state, final_obs, trajectory
+    return next_state, final_obs, rollout
 
 @eqx.filter_jit
 def single_step(step, state, current_obs, policy_fn, key, obs_wrapper=None):
@@ -187,11 +188,11 @@ def single_step(step, state, current_obs, policy_fn, key, obs_wrapper=None):
     terminated = next_state.terminated
     truncated = next_state.truncated
     dones = jnp.bitwise_or(truncated, terminated)  # Probably a better way to handle this but this should suffice for now
-    traj = Trajectory(current_obs, action, action_prob, rewards, dones, state.legal_action_mask)
-    return next_state, next_obs, traj
+    roll = Rollout(current_obs, action, action_prob, rewards, dones, state.legal_action_mask)
+    return next_state, next_obs, roll
 
 @jax.jit
-def generalized_advantage_estimate(values, rewards, dones, discount, lambda_):
+def compute_gae(values, rewards, dones, discount, lambda_):
     # Also heavily inspired by brax implementation
     # assume observations include s_t-s_t+l (so both initial and the final obs) 
     # delta_t = r_t + gamma * v_t+1 - v_t
@@ -213,16 +214,16 @@ def generalized_advantage_estimate(values, rewards, dones, discount, lambda_):
     return gae, value_target
 
 @eqx.filter_jit
-def ppo_loss(ppo_network, trajectory, final_obs, discount, lambda_, eps, value_loss_coeff, entropy_loss_coeff):
+def ppo_loss(ppo_network, rollout, final_obs, eps, value_loss_coeff, entropy_loss_coeff, advantages, value_target):
     # Value loss: L = (r_t + gamma * V(s_t+1) - V(s_t)) ^ 2
     # R_ratio = pi_theta(a_t|s_t) / pi_old(a_t | s_t)
     # Policy loss = min(R_ratio * advantage, clip(R_ratio, 1-eps, 1+eps) * advantage)
-    observations, rewards, dones, actions, mask = trajectory.observations, trajectory.rewards, \
-        trajectory.dones, trajectory.actions, trajectory.mask
+    observations, rewards, dones, actions, mask = rollout.observations, rollout.rewards, \
+        rollout.dones, rollout.actions, rollout.mask
     rewards = jnp.sign(rewards) * (jnp.sqrt(rewards + 1) - 1 + 0.001 * rewards)
     timesteps, batch_size = observations.shape[:2]
     all_observations = jnp.concatenate([observations, jnp.expand_dims(final_obs, 0)]) 
-    old_action_probs = trajectory.action_probs
+    old_action_probs = rollout.action_probs
     # since observations have a shape of (timesteps, batch, (shape)), we have to modify it by rehsaping 
     # first two dims, either that or have to make a more annoying change with a double vmap.
     observations = combine_dims(observations)
@@ -239,9 +240,6 @@ def ppo_loss(ppo_network, trajectory, final_obs, discount, lambda_, eps, value_l
     all_values = ppo_network.value_forward(all_observations)
     all_values = jnp.reshape(all_values, (timesteps + 1, batch_size, -1))
     values = all_values[:-1]
-    advantages, value_target = generalized_advantage_estimate(all_values, rewards, dones,
-                                                              discount, lambda_)
-    advantages = (advantages - jnp.mean(advantages)) / (jnp.std(advantages) + 1e-10)
     value_loss = jnp.mean((values - value_target) ** 2 / 2) 
     
     policy_ratio = jnp.exp(new_action_probs - old_action_probs)
@@ -258,22 +256,23 @@ def ppo_loss(ppo_network, trajectory, final_obs, discount, lambda_, eps, value_l
     }
     return total_loss, metrics
 
-def make_grad_step(model, loss_fn, optim, key, num_minibatches):
+def make_grad_step(model, loss_fn, optim, key, num_minibatches, num_epochs):
     opt_state = optim.init(eqx.filter(model, eqx.is_array))
     @eqx.filter_jit
-    def grad_step(ppo_network, trajectory, final_obs, discount, lambda_, eps, value_loss_coeff, entropy_loss_coeff):
+    def grad_step(ppo_network, rollout, final_obs, discount, lambda_, eps, value_loss_coeff, entropy_loss_coeff):
         nonlocal opt_state, optim, key
         key, subkey = jax.random.split(key)
         model = ppo_network
         
+        advantages, value_target = compute_gae(all_values, rewards, dones, discount, lambda_)
+        advantages = (advantages - jnp.mean(advantages)) / (jnp.std(advantages) + 1e-10)
         def create_minibatches(data):
             data = jax.random.permutation(subkey, data, axis=1)
             data = jnp.swapaxes(data, 0, 1)
             data = jnp.reshape(data, (num_minibatches, -1) + data.shape[1:])
             data = jnp.swapaxes(data, 1, 2)
             return data
-            
-        trajectory = jax.tree_util.tree_map(create_minibatches, trajectory)
+        rollout = jax.tree_util.tree_map(create_minibatches, rollout)
         final_obs = jax.random.permutation(subkey, final_obs, axis=1)
         final_obs = jnp.reshape(final_obs, (num_minibatches, -1) + final_obs.shape[1:])
         
@@ -281,8 +280,8 @@ def make_grad_step(model, loss_fn, optim, key, num_minibatches):
         def f(carry, data):
             arr, opt_state = carry
             model = eqx.combine(arr, static)
-            mini_traj, final = data
-            loss_out, grads = eqx.filter_value_and_grad(loss_fn, allow_int=True, has_aux=True)(model, mini_traj, final, discount, lambda_, eps, value_loss_coeff, entropy_loss_coeff)
+            mini_roll, final = data
+            loss_out, grads = eqx.filter_value_and_grad(loss_fn, allow_int=True, has_aux=True)(model, mini_roll, final, discount, lambda_, eps, value_loss_coeff, entropy_loss_coeff)
             updates, opt_state = optim.update(
                 grads, opt_state, eqx.filter(model, eqx.is_array)
             )
@@ -290,7 +289,7 @@ def make_grad_step(model, loss_fn, optim, key, num_minibatches):
             arr, _ = eqx.partition(model, eqx.is_array)
             return (arr, opt_state), loss_out
         
-        (arr, opt_state), loss_out = jax.lax.scan(f, (arr, opt_state), (trajectory, final_obs))
+        (arr, opt_state), loss_out = jax.lax.scan(f, (arr, opt_state), (rollout, final_obs))
         model = eqx.combine(arr, static)
         loss_out = jax.tree_util.tree_map(jnp.mean, loss_out)
         return loss_out, model
@@ -415,7 +414,7 @@ def main(args):
     key, subkey = jax.random.split(key)
     eval_step = make_eval_step(eval_init, eval_step_fn, eval_batch_size, subkey, obs_wrapper)
     state = init(keys)
-    state, _, _ = collect_trajectory(ppo_network, step_fn, state, state.observation, key, args.init_steps, obs_wrapper=obs_wrapper)
+    state, _, _ = collect_rollout(ppo_network, step_fn, state, state.observation, key, args.init_steps, obs_wrapper=obs_wrapper)
     key, subkey = jax.random.split(key)
     optim = optax.chain(optax.clip_by_global_norm(args.max_grad_norm), optax.adamw(args.lr))
     grad_step = make_grad_step(ppo_network, ppo_loss, optim, subkey, minibatches)
@@ -437,18 +436,18 @@ def main(args):
             eval_timesteps.append(eval_length)
             logger.add_scalar("eval_reward", eval_reward)
             logger.add_scalar("eval_length", eval_length)
-        state, final_obs, traj = collect_trajectory(ppo_network, step_fn, state, state.observation, key, timesteps, obs_wrapper=obs_wrapper)
-        (loss, metrics), ppo_network = grad_step(ppo_network, traj, final_obs, args.discount, args.lambda_, args.clip, args.val_coef, args.ent_coef)
+        state, final_obs, roll = collect_rollout(ppo_network, step_fn, state, state.observation, key, timesteps, obs_wrapper=obs_wrapper)
+        (loss, metrics), ppo_network = grad_step(ppo_network, roll, final_obs, args.discount, args.lambda_, args.clip, args.val_coef, args.ent_coef)
         losses.append(np.array(loss))
         value_losses.append(np.array(metrics['value_loss']))
         policy_losses.append(np.array(metrics['policy_loss']))
         entropy_losses.append(np.array(metrics['entropy_loss']))
-        train_rewards.append(np.array(jnp.sum(traj.rewards) / jnp.sum(traj.dones)))
+        train_rewards.append(np.array(jnp.sum(roll.rewards) / jnp.sum(roll.dones)))
         logger.add_scalar("loss", np.array(loss))
         logger.add_scalar("value_loss", np.array(metrics['value_loss']))
         logger.add_scalar("policy_loss", np.array(metrics['policy_loss']))
         logger.add_scalar("entropy_loss", np.array(metrics['entropy_loss']))
-        logger.add_scalar("train_reward", np.array(jnp.sum(traj.rewards) / jnp.sum(traj.dones)))
+        logger.add_scalar("train_reward", np.array(jnp.sum(roll.rewards) / jnp.sum(roll.dones)))
         logger.write(i)
         logger.add_scalar("epochs over time", i)
         logger.write(time.time() - start_time)
