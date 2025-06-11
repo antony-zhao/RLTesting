@@ -8,15 +8,15 @@ import pgx
 from pgx.experimental import auto_reset
 from matplotlib import pyplot as plt
 from distreqx.distributions.categorical import Categorical
-from utils.logger import Logger
-from utils.jax_utils import init_convnet_weights, orthogonal_init
+from rltesting.utils.logger import Logger
+from rltesting.utils.jax_utils import init_convnet_weights, orthogonal_init
 
 combine_dims = lambda x: jax.lax.collapse(x, 0, 2)
 
 class Rollout(eqx.Module):
     observations: jax.Array
     actions: jax.Array
-    action_probs: jax.Array
+    action_log_probs: jax.Array
     rewards: jax.Array
     dones: jax.Array
     mask: jax.Array
@@ -153,8 +153,8 @@ class PPONetwork(eqx.Module):
         else:
             actions_dist = Categorical(action_logits)
             actions = actions_dist.sample(key)
-            action_probs = actions_dist.log_prob(actions)
-        return actions.astype(jnp.int32), action_probs
+            action_log_probs = actions_dist.log_prob(actions)
+        return actions.astype(jnp.int32), action_log_probs
 
 @eqx.filter_jit
 def collect_rollout(ppo_network, step, state, current_obs, key, num_timesteps, obs_wrapper=None):
@@ -214,16 +214,10 @@ def compute_gae(values, rewards, dones, discount, lambda_):
     return gae, value_target
 
 @eqx.filter_jit
-def ppo_loss(ppo_network, rollout, final_obs, eps, value_loss_coeff, entropy_loss_coeff, advantages, value_target):
+def ppo_loss(ppo_network, observations, actions, old_action_log_probs, mask, values, value_target, advantages, eps, value_loss_coeff, entropy_loss_coeff):
     # Value loss: L = (r_t + gamma * V(s_t+1) - V(s_t)) ^ 2
     # R_ratio = pi_theta(a_t|s_t) / pi_old(a_t | s_t)
     # Policy loss = min(R_ratio * advantage, clip(R_ratio, 1-eps, 1+eps) * advantage)
-    observations, rewards, dones, actions, mask = rollout.observations, rollout.rewards, \
-        rollout.dones, rollout.actions, rollout.mask
-    rewards = jnp.sign(rewards) * (jnp.sqrt(rewards + 1) - 1 + 0.001 * rewards)
-    timesteps, batch_size = observations.shape[:2]
-    all_observations = jnp.concatenate([observations, jnp.expand_dims(final_obs, 0)]) 
-    old_action_probs = rollout.action_probs
     # since observations have a shape of (timesteps, batch, (shape)), we have to modify it by rehsaping 
     # first two dims, either that or have to make a more annoying change with a double vmap.
     observations = combine_dims(observations)
@@ -232,22 +226,17 @@ def ppo_loss(ppo_network, rollout, final_obs, eps, value_loss_coeff, entropy_los
     action_logits = ppo_network.policy_forward(observations)
     action_logits = jnp.where(mask, action_logits, -jnp.inf)
     actions_dist = Categorical(action_logits)
-    new_action_probs = actions_dist.log_prob(actions)
-    new_action_probs = jnp.reshape(new_action_probs, (timesteps, batch_size, 1))
-    old_action_probs = jnp.reshape(old_action_probs, (timesteps, batch_size, 1))
+    new_action_log_probs = actions_dist.log_prob(actions)
+    new_action_log_probs = jnp.reshape(new_action_log_probs, advantages.shape)
+    old_action_log_probs = jnp.reshape(old_action_log_probs, advantages.shape)
     
-    all_observations = combine_dims(all_observations)
-    all_values = ppo_network.value_forward(all_observations)
-    all_values = jnp.reshape(all_values, (timesteps + 1, batch_size, -1))
-    values = all_values[:-1]
     value_loss = jnp.mean((values - value_target) ** 2 / 2) 
     
-    policy_ratio = jnp.exp(new_action_probs - old_action_probs)
+    policy_ratio = jnp.exp(new_action_log_probs - old_action_log_probs)
     policy_loss = -jnp.mean(jnp.minimum(policy_ratio * advantages, 
                                         jnp.clip(policy_ratio, 1-eps, 1+eps) * advantages))
-    # policy_loss = jnp.mean(-jnp.log(new_action_probs) * advantages) # reinforce loss
     
-    entropy_loss = -actions_dist.entropy().mean() #jnp.mean(jnp.sum(action_dist * jnp.log(action_dist + 1e-10), axis=-1))
+    entropy_loss = -actions_dist.entropy().mean()
     total_loss = value_loss * value_loss_coeff + policy_loss + entropy_loss * entropy_loss_coeff
     metrics = {
         "value_loss": value_loss,
@@ -256,43 +245,60 @@ def ppo_loss(ppo_network, rollout, final_obs, eps, value_loss_coeff, entropy_los
     }
     return total_loss, metrics
 
-def make_grad_step(model, loss_fn, optim, key, num_minibatches, num_epochs):
+def make_grad_step(model, loss_fn, optim, key, num_minibatches, num_training_steps):
     opt_state = optim.init(eqx.filter(model, eqx.is_array))
     @eqx.filter_jit
     def grad_step(ppo_network, rollout, final_obs, discount, lambda_, eps, value_loss_coeff, entropy_loss_coeff):
         nonlocal opt_state, optim, key
         key, subkey = jax.random.split(key)
-        model = ppo_network
         
+        observations, rewards, dones, actions, action_log_probs, mask = rollout.observations, rollout.rewards, \
+        rollout.dones, rollout.actions, rollout.action_log_probs, rollout.mask
+        rewards = jnp.sign(rewards) * (jnp.sqrt(rewards + 1) - 1 + 0.001 * rewards)
+        timesteps, batch_size = observations.shape[:2]
+        all_observations = jnp.concatenate([observations, jnp.expand_dims(final_obs, 0)]) 
+        all_values = jax.vmap(ppo_network.value_forward)(all_observations)
+        all_values = jnp.reshape(all_values, (timesteps + 1, batch_size, -1))
         advantages, value_target = compute_gae(all_values, rewards, dones, discount, lambda_)
         advantages = (advantages - jnp.mean(advantages)) / (jnp.std(advantages) + 1e-10)
+        
         def create_minibatches(data):
             data = jax.random.permutation(subkey, data, axis=1)
             data = jnp.swapaxes(data, 0, 1)
             data = jnp.reshape(data, (num_minibatches, -1) + data.shape[1:])
             data = jnp.swapaxes(data, 1, 2)
             return data
-        rollout = jax.tree_util.tree_map(create_minibatches, rollout)
-        final_obs = jax.random.permutation(subkey, final_obs, axis=1)
-        final_obs = jnp.reshape(final_obs, (num_minibatches, -1) + final_obs.shape[1:])
         
-        arr, static = eqx.partition(model, eqx.is_array)
+        obs_batches = create_minibatches(observations)
+        action_batches = create_minibatches(actions)
+        log_prob_batches = create_minibatches(action_log_probs)
+        mask_batches = create_minibatches(mask)
+        value_batches = create_minibatches(all_values[:-1])
+        value_target_batches = create_minibatches(value_target)
+        adv_batches = create_minibatches(advantages)
+        
+        arr, static = eqx.partition(ppo_network, eqx.is_array)
+        
         def f(carry, data):
             arr, opt_state = carry
-            model = eqx.combine(arr, static)
-            mini_roll, final = data
-            loss_out, grads = eqx.filter_value_and_grad(loss_fn, allow_int=True, has_aux=True)(model, mini_roll, final, discount, lambda_, eps, value_loss_coeff, entropy_loss_coeff)
+            ppo_network = eqx.combine(arr, static)
+            obs_batch, action_batch, log_prob_batch, mask_batch, value_batch, value_target_batch, adv_batch = data
+            loss_out, grads = eqx.filter_value_and_grad(loss_fn, allow_int=True, has_aux=True)\
+            (ppo_network, obs_batch, action_batch, log_prob_batch, mask_batch, value_batch, value_target_batch, adv_batch, eps, value_loss_coeff, entropy_loss_coeff)
             updates, opt_state = optim.update(
-                grads, opt_state, eqx.filter(model, eqx.is_array)
+                grads, opt_state, eqx.filter(ppo_network, eqx.is_array)
             )
-            model = eqx.apply_updates(model, updates)
-            arr, _ = eqx.partition(model, eqx.is_array)
+            ppo_network = eqx.apply_updates(ppo_network, updates)
+            arr, _ = eqx.partition(ppo_network, eqx.is_array)
             return (arr, opt_state), loss_out
-        
-        (arr, opt_state), loss_out = jax.lax.scan(f, (arr, opt_state), (rollout, final_obs))
-        model = eqx.combine(arr, static)
-        loss_out = jax.tree_util.tree_map(jnp.mean, loss_out)
-        return loss_out, model
+        loss = []
+        for _ in range(num_training_steps):
+            (arr, opt_state), loss_out = jax.lax.scan(f, (arr, opt_state), (obs_batches, action_batches, log_prob_batches, mask_batches, value_batches, value_target_batches, adv_batches))
+            loss_out = jax.tree_util.tree_map(jnp.mean, loss_out)
+            loss.append(loss_out)
+        loss = jax.tree_util.tree_map(jnp.mean, loss)
+        ppo_network = eqx.combine(arr, static)
+        return loss_out, ppo_network
     return grad_step
 
 def make_eval_step(eval_init, eval_step_fn, eval_batch_size, key, obs_wrapper=None):
@@ -400,6 +406,7 @@ def main(args):
     minibatches = args.num_minibatches
     epochs = args.epochs
     eval_every = args.eval_every
+    train_steps = args.train_steps
 
     obs_wrapper = ToDtype(float, TransposeObservation((2, 0, 1)))
 
@@ -417,7 +424,7 @@ def main(args):
     state, _, _ = collect_rollout(ppo_network, step_fn, state, state.observation, key, args.init_steps, obs_wrapper=obs_wrapper)
     key, subkey = jax.random.split(key)
     optim = optax.chain(optax.clip_by_global_norm(args.max_grad_norm), optax.adamw(args.lr))
-    grad_step = make_grad_step(ppo_network, ppo_loss, optim, subkey, minibatches)
+    grad_step = make_grad_step(ppo_network, ppo_loss, optim, subkey, minibatches, train_steps)
     
     logger = Logger('logs')
     losses = []
@@ -507,13 +514,14 @@ if __name__ == '__main__':
     parser.add_argument('--ent_coef', type=float, default=0.001)
     parser.add_argument('--max_grad_norm', type=float, default=0.2)
     parser.add_argument('--rollout_length', type=int, default=64)
-    parser.add_argument('--num_envs', type=int, default=8192)
+    parser.add_argument('--num_envs', type=int, default=4096)
     parser.add_argument('--num_eval_envs', type=int, default=128)
     parser.add_argument('--num_minibatches', type=int, default=64)
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--epochs', type=int, default=100000)
     parser.add_argument('--eval_every', type=int, default=100)
     parser.add_argument('--init_steps', type=int, default=100)
+    parser.add_argument('--train_steps', type=int, default=4)
     args = parser.parse_args()
     main(args)
     
