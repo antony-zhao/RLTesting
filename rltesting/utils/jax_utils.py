@@ -3,6 +3,7 @@ import jax.numpy as jnp
 import equinox as eqx
 
 orthogonal_initializer = jax.nn.initializers.orthogonal()
+combine_dims = lambda x: jax.lax.collapse(x, 0, 2)
 
 is_linear = lambda x: isinstance(x, eqx.nn.Linear)
 is_conv = lambda x: isinstance(x, eqx.nn.Conv)
