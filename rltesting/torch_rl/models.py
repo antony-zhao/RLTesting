@@ -1,15 +1,20 @@
 from torch import nn
 import torch
 import numpy as np
+import torch.nn.functional as F
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
     torch.nn.init.constant_(layer.bias, bias_const)
     return layer
 
+def compute_pad(kernel_size, stride):
+    return int(np.ceil((kernel_size - stride) / 2))
+
 class MLP(nn.Module):
+    # if hidden dims is specified then doesn't use skip connections
     def __init__(self, input_dim, output_dim, hidden_dim=256, num_hiddens=2, act=nn.SiLU, hidden_dims=None):
-        super(MLP, self).__init__()
+        super().__init__()
         if hidden_dims is not None:
             assert len(hidden_dims) + 1 == num_hiddens
             hidden_dim = hidden_dims[0]
@@ -40,7 +45,7 @@ class MLP(nn.Module):
 
 class ResBlock(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, stride=1, act=nn.SiLU):
-        super(ResBlock, self).__init__()
+        super().__init__()
         padding = int((kernel_size - 1) // 2)
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding)
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size, 1, padding)
@@ -59,18 +64,10 @@ class ResBlock(nn.Module):
         return x + x_skip
 
 class AtariConv(nn.Module):
+    # from the original Nature DQN paper
     # assumes the 84x84 grayscale and 4 frame stack
     def __init__(self, act=nn.SiLU, flatten_out=False, input_channels=4):
-        super(AtariConv, self).__init__()
-        # self.convs = nn.Sequential(
-        #     ResBlock(in_channels=input_channels, out_channels=32, kernel_size=7, stride=3), # (4, 84, 84) -> (32, 28, 28)
-        #     act(),
-        #     ResBlock(in_channels=32, out_channels=64, kernel_size=5, stride=2), # (32, 28, 28) -> (64, 14, 14)
-        #     act(),
-        #     ResBlock(in_channels=64, out_channels=128, kernel_size=3, stride=2), # (64, 14, 14) -> (128, 7, 7)
-        #     act(),
-        #     ResBlock(in_channels=128, out_channels=256, kernel_size=3, stride=2) # (128, 7, 7) -> (256, 4, 4) or 4096
-        # )
+        super().__init__()
         self.convs = nn.Sequential(
             nn.Conv2d(input_channels, 32, 8, stride=4),
             act(),
@@ -93,4 +90,72 @@ class AtariConv(nn.Module):
             return x.view(-1, self.output_dim)
         else:
             return x
+
+class IMPALACnn(nn.Module):
+    pass
+
+class ChannelNorm(nn.Module):
+    def __init__(self, num_channels, eps=1e-5):
+        super().__init__()
+        self.norm = nn.LayerNorm(num_channels, eps)
+    
+    def forward(self, x):
+        x = x.permute(0, 2, 3, 1)
+        x = self.norm(x)
+        x = x.permute(0, 3, 1, 2)
+        return x
+    
+class NormAndAct(nn.Module):
+    # fix needed, include dimension for norm
+    def __init__(self, norm_dim, norm=nn.LayerNorm, act=nn.SiLU):
+        super().__init__()
+        self.act = nn.Sequential(norm(norm_dim), act())
+    
+    def forward(self, x):
+        return self.act(x)
+
+class DreamerEncoderConv(nn.Module):
+    # built for 64x64 observations and downscales them to 4x4, can do other sizes but would need to be changed a bit
+    def __init__(self, filter_base=8, num_convs=4, kernel_size=4, image_channels=3, input_size=64, act=nn.SiLU, norm=ChannelNorm):
+        super().__init__()
+        filters = [filter_base * 2 ** i for i in range(num_convs)]
+        layers = []
+        for i, filter in enumerate(filters):
+            layers.append(nn.Conv2d(image_channels if i == 0 else filters[i - 1], filter, kernel_size, 2, padding=compute_pad(kernel_size, 2)))
+            if i < len(filters) - 1:
+                layers.append(NormAndAct(filter, norm, act))
+        self.layers = nn.Sequential(*layers)
+        size = input_size // (2 ** num_convs)
+        self.output_size = (filters[-1], size, size)
+    
+    def forward(self, x):
+        return self.layers(x)
+    
+class DreamerDecoderConv(nn.Module):
+    # does the reverse of the encoder conv, pass in reversed filters
+    def __init__(self, filter_base=8, num_convs=4, kernel_size=4, image_channels=3, act=nn.SiLU, norm=ChannelNorm):
+        super().__init__()
+        filters = [filter_base * 2 ** i for i in reversed(range(num_convs))]
+        layers = []
+        for i, filter in enumerate(filters):
+            layers.append(nn.ConvTranspose2d(filter, image_channels if i == len(filters) - 1 else filters[i + 1], kernel_size, 2, padding=compute_pad(kernel_size, 2)))
+            if i < len(filters) - 1:
+                layers.append(NormAndAct(image_channels if i == len(filters) - 1 else filters[i + 1], norm, act))
+        self.layers = nn.Sequential(*layers)
+    
+    def forward(self, x):
+        return self.layers(x)
+
+class BlockLinear(nn.Module):
+    def __init__(self, input_size, output_size, num_blocks=8):
+        super().__init__()
+        self.networks = nn.ModuleList([nn.Linear(input_size // num_blocks, output_size // num_blocks) for _ in range(num_blocks)])
+        self.num_blocks = num_blocks
+    
+    def forward(self, x):
+        output = []
+        x_chunks = torch.split(x, x.shape[-1] // self.num_blocks, dim=-1)
+        for i in range(self.num_blocks):
+            output.append(self.networks[i](x_chunks[i]))
+        return torch.cat(output, -1)
     
