@@ -158,4 +158,22 @@ class BlockLinear(nn.Module):
         for i in range(self.num_blocks):
             output.append(self.networks[i](x_chunks[i]))
         return torch.cat(output, -1)
+
+class DreamerGRU(nn.Module):
+    def __init__(self, hidden_state_size, use_block_linear=True):
+        super().__init__()
+        if use_block_linear:
+            self.layer = BlockLinear(hidden_state_size, hidden_state_size * 3)
+        else:
+            self.layer = nn.Linear(hidden_state_size, hidden_state_size * 3)
+        self.hidden_state_size = hidden_state_size
+    
+    def forward(self, h):
+        x = self.layer(h)
+        reset, cand, update = torch.split(x, self.hidden_state_size, -1)
+        reset = F.sigmoid(reset)
+        cand = F.tanh(reset * cand)
+        update = F.sigmoid(update - 1)
+        h_new = update * cand + (1 - update) * h
+        return h_new
     

@@ -4,8 +4,8 @@ import torch.nn.functional as F
 from torch.distributions import Categorical, TanhTransform
 import numpy as np
 
-from models import MLP, AtariConv
-from utils import to_numpy, get_action_dim, get_obs_shape
+from rltesting.torch_rl.models import MLP, AtariConv, layer_init
+from rltesting.utils.torch_utils import to_numpy, get_action_dim, get_obs_shape
 
 class Rollout:
     obs: np.ndarray

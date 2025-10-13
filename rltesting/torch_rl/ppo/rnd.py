@@ -3,9 +3,9 @@ from torch import nn
 import torch.nn.functional as F
 import numpy as np
 
-from models import MLP, AtariConv, layer_init
-from ppo import compute_gae, PPONetwork, AtariPolicyNetwork
-from utils import to_numpy, get_action_dim, get_obs_shape
+from rltesting.torch_rl.models import MLP, AtariConv, layer_init
+from rltesting.torch_rl.ppo.ppo import compute_gae, PPONetwork, AtariPolicyNetwork
+from rltesting.utils.torch_utils import to_numpy, get_action_dim, get_obs_shape
 
 class RND_Rollout:
     obs: np.ndarray

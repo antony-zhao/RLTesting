@@ -2,15 +2,12 @@ from torch import nn
 import torch
 import numpy as np
 import torch.nn.functional as F
-from rltesting.torch_rl.models import DreamerDecoderConv, DreamerEncoderConv, BlockLinear, MLP, NormAndAct
+from rltesting.torch_rl.models import DreamerDecoderConv, DreamerEncoderConv, MLP, NormAndAct, DreamerGRU
+from rltesting.torch_rl.dreamer.utils import *
 import argparse
 from functools import partial
 
-# These should definitely take in like a config dictionary instead of the current approach, too many variables otherwise
-
-def unimix(x, num_codes, proportion=0.01):
-    uniform = torch.ones_like(x) / num_codes
-    return x * (1 - proportion) + uniform * proportion
+mlp_norm_act = lambda dim, act: partial(NormAndAct, norm_dim=dim, act=act)
 
 class DreamerEncoder(nn.Module):
     # if obs_type isn't image then input_dim should be specified
@@ -23,7 +20,7 @@ class DreamerEncoder(nn.Module):
             self.encoder = DreamerEncoderConv(config.filter_base, config.num_convs, config.kernel_size, config.num_channels, config.image_size, config.act)
             output_dim = np.prod(self.encoder.output_size)
         else:
-            self.encoder = MLP(config.obs_dim, config.hidden_dim, config.hidden_dim, num_hiddens=1, act=partial(NormAndAct, norm_dim=config.hidden_dim, act=config.act))
+            self.encoder = MLP(config.obs_dim, config.hidden_dim, config.hidden_dim, num_hiddens=config.num_hiddens, act=mlp_norm_act(config.hidden_dim, config.act))
             output_dim = config.hidden_dim
         self.out = nn.Linear(output_dim + config.hidden_state_size, config.num_latents * config.num_codes)
         self.num_latents = config.num_latents
@@ -51,7 +48,7 @@ class DreamerDecoder(nn.Module):
             self.decoder = DreamerDecoderConv(config.filter_base, config.num_convs, config.kernel_size, config.num_channels, config.act)
         else:
             self._in = nn.Linear(config.hidden_state_size + config.num_latents * config.num_codes, config.hidden_dim)
-            self.decoder = MLP(config.hidden_dim, config.hidden_dim, config.obs_dim, num_hiddens=1, act=partial(NormAndAct, norm_dim=config.hidden_dim, act=config.act))
+            self.decoder = MLP(config.hidden_dim, config.hidden_dim, config.obs_dim, num_hiddens=config.num_hiddens, act=mlp_norm_act(config.hidden_dim, config.act))
     
     def forward(self, z, h):
         x = torch.cat([torch.flatten(z, 1), h], -1)
@@ -61,32 +58,15 @@ class DreamerDecoder(nn.Module):
         reconstruction = self.decoder(x)
         return reconstruction
 
-class DreamerGRU(nn.Module):
-    def __init__(self, hidden_state_size, use_block_linear=True):
-        super().__init__()
-        if use_block_linear:
-            self.layer = BlockLinear(hidden_state_size, hidden_state_size * 3)
-        else:
-            self.layer = nn.Linear(hidden_state_size, hidden_state_size * 3)
-        self.hidden_state_size = hidden_state_size
-    
-    def forward(self, h):
-        x = self.layer(h)
-        reset, cand, update = torch.split(x, self.hidden_state_size, -1)
-        reset = F.sigmoid(reset)
-        cand = F.tanh(reset * cand)
-        update = F.sigmoid(update - 1)
-        h_new = update * cand + (1 - update) * h
-        return h_new
-
 class RSSM(nn.Module):
+    # Also called the sequence model
     def __init__(self, config):
         super().__init__()
         self.in_hidden = nn.Linear(config.hidden_state_size, config.hidden_dim)
         self.in_latent = nn.Linear(config.num_latents * config.num_codes, config.hidden_dim)
         self.in_action = nn.Linear(config.action_dim, config.hidden_dim)
         self.act1 = NormAndAct(config.hidden_dim * 3)
-        self.mlp = MLP(config.hidden_dim* 3, config.hidden_state_size, config.hidden_dim, num_hiddens=1, act=partial(NormAndAct, norm_dim=config.hidden_dim, act=config.act))
+        self.mlp = MLP(config.hidden_dim * 3, config.hidden_state_size, config.hidden_dim, num_hiddens=config.num_hiddens, act=mlp_norm_act(config.hidden_dim, config.act))
         self.gru = DreamerGRU(config.hidden_state_size, config.use_block_linear)
     
     def forward(self, h, z, a):
@@ -101,8 +81,31 @@ class RSSM(nn.Module):
         return h_new
 
 class DreamerWorldModel(nn.Module):
+    # TODO either here or in RSSM, need the prior (or is it posterior) model which predicts the next latent from current latent and hidden without needing the encoding from the image
     def __init__(self, config):
         super().__init__()
+        self.encoder = DreamerEncoder(config)
+        self.decoder = DreamerDecoder(config)
+        self.rssm = RSSM(config)
+        self.dynamics_predictor = MLP(config.hidden_state_size, config.latent_size, config.hiddem_dim, config.num_hiddens, mlp_norm_act(config.hidden_dim, config.act))
+        self.reward_predictor = MLP(config.hidden_state_size, 1, config.hiddem_dim, config.num_hiddens, mlp_norm_act(config.hidden_dim, config.act))
+        self.continue_predictor = MLP(config.hidden_state_size, 1, config.hiddem_dim, config.num_hiddens, mlp_norm_act(config.hidden_dim, config.act))
+    
+    def world_model_loss(self, obs, actions, rewards, dones):
+        pass
+    
+    def prediction_loss(self, obs, reconstruction, reward, reward_prediction, dones, continue_prediction):
+        reconstruction_error = symlog_squared_error(obs, reconstruction)
+        reward_error = symlog_squared_error(reward, reward_prediction) # need to do two hot loss somehow
+        continue_error = F.binary_cross_entropy((1 - dones), continue_prediction)
+        return reconstruction_error + reward_error + continue_error
+    
+    def dynamics_loss(self, latent, latent_prediction):
+        return max(1, F.kl_div(latent.detach(), latent_prediction))
+    
+    def representation_loss(self, latent, latent_prediction):
+        return max(F.kl_div(latent, latent_prediction.detach()))
+        
 
 
 if __name__ == "__main__":
@@ -111,21 +114,26 @@ if __name__ == "__main__":
     parser.add_argument("--obs_type", default="image", choices=["image", "vector"])
     encoder_parser = parser.add_argument_group("encoder")
     vector_parser = parser.add_argument_group("vector")
+    world_model_parser = parser.add_argument_group("world_model")
     encoder_parser.add_argument("--num_channels", default=3, type=int)
     encoder_parser.add_argument("--image_size", default=64, type=int) # images should be square
     encoder_parser.add_argument("--kernel_size", default=4, type=int) # best to keep it 4 or 6
     encoder_parser.add_argument("--filter_base", default=8, type=int) # the base number of filters, which is doubled for each convolutional layer
     encoder_parser.add_argument("--num_convs", default=4, type=int) # total number of convolutions, after which the dimension is size / 2^num_convs, and the final number of filters is filter_base * 2^(num_convs-1)
     vector_parser.add_argument("--obs_dim", default=None, type=int)
-    parser.add_argument("--hidden_dim", default=1024, type=int) # hidden dims of MLPs
-    parser.add_argument("--hidden_state_size", default=8192, type=int) # hidden state of GRU/RSSM
-    parser.add_argument("--num_hidden", default=1, type=int) # determines the depth for various MLPs
-    parser.add_argument("--action_dim", default=18, type=int)
-    parser.add_argument("--num_latents", default=32, type=int) # the number of rows in the latent
-    parser.add_argument("--num_codes", default=64, type=int) # the actual dim that's softmaxed over in the latent
-    parser.add_argument("--latent_unimix", default=0.01, type=float)
-    parser.add_argument("--use_block_linear", default=True, type=bool)
-    parser.add_argument("--act", default="silu", choices=["silu", "gelu", "relu"])
+    world_model_parser.add_argument("--hidden_dim", default=1024, type=int) # hidden dims of MLPs
+    world_model_parser.add_argument("--hidden_state_size", default=8192, type=int) # hidden state of GRU/RSSM
+    world_model_parser.add_argument("--num_hiddens", default=1, type=int) # determines the depth for various MLPs
+    world_model_parser.add_argument("--action_dim", default=18, type=int)
+    world_model_parser.add_argument("--num_latents", default=32, type=int) # the number of rows in the latent
+    world_model_parser.add_argument("--num_codes", default=64, type=int) # the actual dim that's softmaxed over in the latent
+    world_model_parser.add_argument("--latent_unimix", default=0.01, type=float)
+    world_model_parser.add_argument("--use_block_linear", default=True, type=bool)
+    world_model_parser.add_argument("--act", default="silu", choices=["silu", "gelu", "relu"])
+    world_model_parser.add_argument("--prediction_loss_coeff", default=1, type=float)
+    world_model_parser.add_argument("--dynamics_loss_coeff", default=1, type=float)
+    world_model_parser.add_argument("--representation_loss_coeff", default=0.1, type=float)
+    world_model_parser.add_argument("--free_nats", default=1, type=float)
     config = parser.parse_args()
     if config.act == "silu":
         config.act = nn.SiLU
@@ -137,6 +145,7 @@ if __name__ == "__main__":
         config.image_dim = (config.num_channels, config.image_size, config.image_size)
         size = config.image_size // 2 ** (config.num_convs)
         config.output_dim = (config.filter_base * 2 ** (config.num_convs - 1), size, size)
+    config.latent_size = config.num_latents * config.num_codes
     
     test_image = torch.randn((1, *config.image_dim))
     test_hidden = torch.zeros((1, config.hidden_state_size))
