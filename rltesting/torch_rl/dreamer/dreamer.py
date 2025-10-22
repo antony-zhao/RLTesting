@@ -6,6 +6,7 @@ from rltesting.torch_rl.models import DreamerDecoderConv, DreamerEncoderConv, ML
 from rltesting.torch_rl.dreamer.utils import *
 import argparse
 from functools import partial
+from torch.distributions import OneHotCategoricalStraightThrough, Independent, Categorical, Normal, kl_divergence
 
 mlp_norm_act = lambda dim, act: partial(NormAndAct, norm_dim=dim, act=act)
 
@@ -64,7 +65,7 @@ class RSSM(nn.Module):
         super().__init__()
         self.in_hidden = nn.Linear(config.hidden_state_size, config.hidden_dim)
         self.in_latent = nn.Linear(config.num_latents * config.num_codes, config.hidden_dim)
-        self.in_action = nn.Linear(config.action_dim, config.hidden_dim)
+        self.in_action = nn.Linear(config.action_dim, config.hidden_dim) # the required input layers for each of the three needed inputs
         self.act1 = NormAndAct(config.hidden_dim * 3)
         self.mlp = MLP(config.hidden_dim * 3, config.hidden_state_size, config.hidden_dim, num_hiddens=config.num_hiddens, act=mlp_norm_act(config.hidden_dim, config.act))
         self.gru = DreamerGRU(config.hidden_state_size, config.use_block_linear)
@@ -81,31 +82,147 @@ class RSSM(nn.Module):
         return h_new
 
 class DreamerWorldModel(nn.Module):
-    # TODO either here or in RSSM, need the prior (or is it posterior) model which predicts the next latent from current latent and hidden without needing the encoding from the image
     def __init__(self, config):
         super().__init__()
         self.encoder = DreamerEncoder(config)
         self.decoder = DreamerDecoder(config)
         self.rssm = RSSM(config)
-        self.dynamics_predictor = MLP(config.hidden_state_size, config.latent_size, config.hiddem_dim, config.num_hiddens, mlp_norm_act(config.hidden_dim, config.act))
-        self.reward_predictor = MLP(config.hidden_state_size, 1, config.hiddem_dim, config.num_hiddens, mlp_norm_act(config.hidden_dim, config.act))
-        self.continue_predictor = MLP(config.hidden_state_size, 1, config.hiddem_dim, config.num_hiddens, mlp_norm_act(config.hidden_dim, config.act))
+        self.dynamics_predictor = MLP(config.hidden_state_size, config.latent_size, config.hidden_dim, config.num_hiddens, mlp_norm_act(config.hidden_dim, config.act))
+        self.reward_predictor = MLP(config.state_size, config.num_bins, config.hidden_dim, config.num_hiddens, mlp_norm_act(config.hidden_dim, config.act))
+        self.continue_predictor = MLP(config.state_size, 1, config.hidden_dim, config.num_hiddens, mlp_norm_act(config.hidden_dim, config.act))
+        self.rollout_length = config.rollout_length
     
-    def world_model_loss(self, obs, actions, rewards, dones):
-        pass
+    def image_rollout(self, hidden, actor):
+        # Used for actor critic training
+        # returns a sequence of 
+        # s_1 - s_t (where s = {h, z})
+        # a_1 - a_t
+        # r_1 - r_t
+        # v_1 - v_t
+        # c_t - c_t
+        hiddens = []
+        latents = []
+        actions = []
+        for i in range(self.rollout_length):
+            probs = self.dynamics_predictor(hidden)
+            latent = Independent(OneHotCategoricalStraightThrough(probs), 1).rsample()
+            action = actor.choose_action(latent, hidden) # some placeholder function TO BE IMPLEMENTED
+            hiddens.append(hidden)
+            latents.append(latent)
+            actions.append(action)
+            if i < self.rollout_length - 1:
+                hidden = self.rssm(hidden, latent, action)
+        hiddens = torch.cat(hiddens)
+        latents = torch.cat(latents)
+        actions = torch.cat(actions)
     
-    def prediction_loss(self, obs, reconstruction, reward, reward_prediction, dones, continue_prediction):
+    def world_model_loss(self, obs, actions, rewards, dones, hidden):
+        hiddens = []
+        latents_enc = []
+        latents_dyn = []
+        reconstructions = []
+        for i in range(self.rollout_length):
+            probs_enc = self.encoder(obs[i], hidden)
+            latent_enc = Independent(OneHotCategoricalStraightThrough(probs_enc), 1).rsample()
+            probs_dyn = self.dynamics_predictor(hidden)
+            latent_dyn = Independent(OneHotCategoricalStraightThrough(probs_dyn), 1).rsample()
+            reconstruction = self.decoder(latent_dyn, hidden)
+            rew_prob = self.reward_predictor(latent_dyn, hidden)
+            continue_pred = self.continue_predictor(latent_dyn, hidden)
+            if i < self.rollout_length - 1:
+                hidden = self.rssm(hidden, latent_dyn, actions[i])
+    
+    def prediction_loss(self, obs, reconstruction, reward, reward_probs, dones, continue_prediction):
         reconstruction_error = symlog_squared_error(obs, reconstruction)
-        reward_error = symlog_squared_error(reward, reward_prediction) # need to do two hot loss somehow
+        reward_prediction = WeightedAverageOverBins(reward_probs)
+        reward_error = reward_prediction.log_prob(reward)
         continue_error = F.binary_cross_entropy((1 - dones), continue_prediction)
         return reconstruction_error + reward_error + continue_error
     
-    def dynamics_loss(self, latent, latent_prediction):
-        return max(1, F.kl_div(latent.detach(), latent_prediction))
+    def dynamics_loss(self, probs_enc, probs_dyn):
+        latent_enc = Independent(OneHotCategoricalStraightThrough(probs_enc), 1)
+        latent_dyn = Independent(OneHotCategoricalStraightThrough(probs_dyn), 1).rsample()
+        return torch.clip(kl_divergence(latent_enc.detach(), latent_dyn), max=1)
     
-    def representation_loss(self, latent, latent_prediction):
-        return max(F.kl_div(latent, latent_prediction.detach()))
+    def representation_loss(self,  probs_enc, probs_dyn):
+        latent_enc = Independent(OneHotCategoricalStraightThrough(probs_enc), 1)
+        latent_dyn = Independent(OneHotCategoricalStraightThrough(probs_dyn), 1).rsample()
+        return torch.clip(kl_divergence(latent_enc, latent_dyn.detach()), max=1)  
+          
+class Actor(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.mlp = MLP(config.state_size, config.action_dim, config.hidden_dim)
+        self.action_type = config.action_type
+        if config.action_type == "continuous":
+            self.log_std = nn.Parameter(-torch.ones(config.action_dim))
+    
+    def policy_dist(self, x):
+        logits = self.mlp(x)
+        if self.action_type == "discrete":
+            action_dist = Categorical(logits=logits)
+        else:
+            action_dist = Normal(loc=logits, scale=torch.exp(self.log_std))
+        return action_dist
+    
+    def policy_fn(self, x, det=False):
+        # actually choosing the action, returns the actual action as well as the log prob of the action
+        if not det:
+            action_dist = self.policy_dist(x)
+        else:
+            action_mean = self.mlp(x)
+            return action_mean, None, None
         
+        if self.action_type == "discrete":
+            action = action_dist.sample()
+        else:
+            action = action_dist.rsample()
+            
+        return action, action_dist.log_prob(action).sum(-1), action_dist.entropy()
+    
+    def choose_action(self, x, det=False):
+        if not det:
+            action_dist = self.policy_dist(x)
+        else:
+            action_mean = self.mlp(x)
+            return action_mean
+        
+        if self.action_type == "discrete":
+            action = action_dist.sample()
+        else:
+            action = action_dist.rsample()
+            
+        return action
+    
+class Critic(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.mlp = MLP(config.state_size, config.num_bins, config.hidden_dim)
+    
+    def forward(self, x):
+        logits = self.mlp(x)
+        probs = torch.softmax(logits, dim=-1)
+        weighted_average = WeightedAverageOverBins(probs)
+        return weighted_average.weighted_average(), weighted_average
+
+class DreamerV3:
+    def __init__(self, config):
+        self.world_model = DreamerWorldModel(config)
+        self.actor = Actor(config)
+        self.critic = Critic(config)
+        # decide whether or not to leave the optimizers in here, if so it might be good to modify some of the other classes to follow a similar 
+        # pattern but then again dreamer is so much more different it might be fine
+        self.buffer = None
+        # buffer needs to account for order in episodes
+    
+    def train_world_model(self):
+        pass
+    
+    def train_actor_critic(self):
+        pass
+    
+    def add_episode(self):
+        pass
 
 
 if __name__ == "__main__":
@@ -125,6 +242,7 @@ if __name__ == "__main__":
     world_model_parser.add_argument("--hidden_state_size", default=8192, type=int) # hidden state of GRU/RSSM
     world_model_parser.add_argument("--num_hiddens", default=1, type=int) # determines the depth for various MLPs
     world_model_parser.add_argument("--action_dim", default=18, type=int)
+    world_model_parser.add_argument("--action_type", default="discrete", choices=["discrete", "continuous"])
     world_model_parser.add_argument("--num_latents", default=32, type=int) # the number of rows in the latent
     world_model_parser.add_argument("--num_codes", default=64, type=int) # the actual dim that's softmaxed over in the latent
     world_model_parser.add_argument("--latent_unimix", default=0.01, type=float)
@@ -134,6 +252,9 @@ if __name__ == "__main__":
     world_model_parser.add_argument("--dynamics_loss_coeff", default=1, type=float)
     world_model_parser.add_argument("--representation_loss_coeff", default=0.1, type=float)
     world_model_parser.add_argument("--free_nats", default=1, type=float)
+    world_model_parser.add_arugment("--bin_low", default=-20, type=int)
+    world_model_parser.add_argument("--bin_high", default=20, type=int)
+    parser.add_argument("--rollout_length", default=16, type=int)
     config = parser.parse_args()
     if config.act == "silu":
         config.act = nn.SiLU
@@ -146,6 +267,8 @@ if __name__ == "__main__":
         size = config.image_size // 2 ** (config.num_convs)
         config.output_dim = (config.filter_base * 2 ** (config.num_convs - 1), size, size)
     config.latent_size = config.num_latents * config.num_codes
+    config.state_size = config.hidden_state_size + config.latent_size
+    config.num_bins = (config.bin_high - config.bin_low) + 1 # inclusive of both high and low
     
     test_image = torch.randn((1, *config.image_dim))
     test_hidden = torch.zeros((1, config.hidden_state_size))

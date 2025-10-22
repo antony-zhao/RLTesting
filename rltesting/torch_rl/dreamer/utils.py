@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 import numpy as np
 
 def unimix(x, num_codes, proportion=0.01):
@@ -14,30 +15,36 @@ def symexp(x):
 def symlog_squared_error(y, y_hat):
     return 1/2 * (symlog(y) - y_hat) ** 2
 
+def sample_latent(probs):
+    pass
+
 class WeightedAverageOverBins:
-    def __init__(self, low=-20, high=20, forward=symexp, backward=symlog):
+    def __init__(self, probs=None, logits=None, low=-20, high=20, forward=symexp, backward=symlog):
+        if probs is None:
+            self.probs = torch.softmax(logits, -1)
         self.bins = torch.linspace(low, high)
         self.low = low
         self.high = high
         self.forward = forward
         self.backward = backward
     
-    def forward(self, logits):
-        probs = torch.softmax(logits, -1)
-        weighted_average = probs @ self.bins.T
+    def weighted_average(self):
+        weighted_average = self.probs @ self.bins.T
         return self.forward(weighted_average)
     
     def two_hot(self, vals):
-        index_1 = int(vals) - self.low
+        # assumes bins are spaced 1 apart
+        index_1 = vals.type(torch.int) - self.low
         index_2 = index_1 + 1
-        proportion_2 = vals - int(vals)
+        proportion_2 = vals - vals.type(torch.int)
         proportion_1 = 1 - proportion_2
-        two_hot_encoded = torch.zeros((vals.shape[0], self.high - self.low))
-        two_hot_encoded[index_1] = proportion_1
-        two_hot_encoded[index_2] = proportion_2
+        one_hot_1 = F.one_hot(index_1, len(self.bins))
+        one_hot_2 = F.one_hot(index_2, len(self.bins))
+        two_hot_encoded = proportion_1 * one_hot_1 + proportion_2 * one_hot_2
         return two_hot_encoded
     
-    def log_prob(self, vals, logits):
+    def log_prob(self, vals):
         # basically just the loss
-        target = self.two_hot(vals)
-        return -target @ torch.log(torch.softmax(logits, -1))
+        target = self.two_hot(self.backward(vals))
+        return -target @ torch.log(self.probs)
+    

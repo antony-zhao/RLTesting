@@ -91,6 +91,9 @@ class AtariConv(nn.Module):
         else:
             return x
 
+class IMPALABlock(nn.Module):
+    pass
+
 class IMPALACnn(nn.Module):
     pass
 
@@ -176,4 +179,7 @@ class DreamerGRU(nn.Module):
         update = F.sigmoid(update - 1)
         h_new = update * cand + (1 - update) * h
         return h_new
-    
+
+class TargetNetwork(nn.Module):
+    def __init__(self, original_network):
+        pass
