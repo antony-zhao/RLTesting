@@ -21,4 +21,4 @@ def random_sample_single_env(env, num_steps=1000):
         rewards.append(reward)
         dones.append(done)
     
-    return np.concat(observations), actions, rewards, dones
+    return np.stack(observations), np.stack(actions), np.stack(rewards), np.stack(dones)
