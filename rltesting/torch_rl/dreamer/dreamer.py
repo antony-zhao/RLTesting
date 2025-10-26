@@ -71,7 +71,7 @@ class RSSM(nn.Module):
         self.gru = DreamerGRU(config.hidden_state_size, config.use_block_linear)
     
     def forward(self, h, z, a):
-        flattened_latent = torch.flatten(z, 1)
+        flattened_latent = torch.flatten(z, -2)
         x1 = self.in_hidden(h)
         x2 = self.in_latent(flattened_latent)
         x3 = self.in_action(a) # need to verify that this is a copy of the action with no gradients
@@ -92,6 +92,16 @@ class DreamerWorldModel(nn.Module):
         self.continue_predictor = MLP(config.state_size, 1, config.hidden_dim, config.num_hiddens, mlp_norm_act(config.hidden_dim, config.act))
         self.rollout_length = config.rollout_length
     
+    def imagine_step(self, hidden, latent, action):
+        # treat this like how you would a normal environment step
+        # state is {z, h}
+        state = torch.cat([latent.flatten(-2), hidden])
+        continue_ = self.continue_predictor(state)
+        reward = self.reward_predictor(state)
+        next_hidden = self.rssm(hidden, latent, action) * continue_
+        next_latent = self.dynamics_predictor(next_hidden)
+        return (next_hidden, next_latent), reward, continue_
+    
     def image_rollout(self, hidden, actor):
         # Used for actor critic training
         # returns a sequence of 
@@ -107,30 +117,45 @@ class DreamerWorldModel(nn.Module):
             probs = self.dynamics_predictor(hidden)
             latent = Independent(OneHotCategoricalStraightThrough(probs), 1).rsample()
             action = actor.choose_action(latent, hidden) # some placeholder function TO BE IMPLEMENTED
+            state = torch.cat([latent.flatten(-2), hidden])
+            continue_ = self.continue_predictor(state)
             hiddens.append(hidden)
             latents.append(latent)
             actions.append(action)
             if i < self.rollout_length - 1:
-                hidden = self.rssm(hidden, latent, action)
+                hidden = self.rssm(hidden, latent, action) * continue_
         hiddens = torch.cat(hiddens)
         latents = torch.cat(latents)
         actions = torch.cat(actions)
     
     def world_model_loss(self, obs, actions, rewards, dones, hidden):
-        hiddens = []
-        latents_enc = []
-        latents_dyn = []
+        enc_probs = []
+        dyn_probs = []
         reconstructions = []
+        continue_preds = []
+        reward_probs = []
         for i in range(self.rollout_length):
             probs_enc = self.encoder(obs[i], hidden)
             latent_enc = Independent(OneHotCategoricalStraightThrough(probs_enc), 1).rsample()
+            enc_probs.append(probs_enc)
             probs_dyn = self.dynamics_predictor(hidden)
-            latent_dyn = Independent(OneHotCategoricalStraightThrough(probs_dyn), 1).rsample()
-            reconstruction = self.decoder(latent_dyn, hidden)
-            rew_prob = self.reward_predictor(latent_dyn, hidden)
-            continue_pred = self.continue_predictor(latent_dyn, hidden)
+            # latent_dyn = Independent(OneHotCategoricalStraightThrough(probs_dyn), 1).rsample()
+            dyn_probs.append(probs_dyn)
+            reconstruction = self.decoder(latent_enc, hidden)
+            reconstructions.append(reconstruction)
+            state = torch.cat([latent_enc.flatten(-2), hidden])
+            reward_prob = self.reward_predictor(state)
+            reward_probs.append(reward_prob)
+            continue_pred = self.continue_predictor(state)
+            continue_preds.append(continue_pred)
             if i < self.rollout_length - 1:
-                hidden = self.rssm(hidden, latent_dyn, actions[i])
+                hidden = self.rssm(hidden, latent_enc, actions[i])
+        pred_loss = self.prediction_loss(obs, reconstructions, rewards, reward_probs, dones, continue_preds)
+        dyn_loss = self.dynamics_loss(enc_probs, dyn_probs)
+        rep_loss = self.representation_loss(enc_probs, dyn_probs)
+        loss = pred_loss * 1 + dyn_loss * 1 + rep_loss * 0.1
+        return loss, {"prediction loss": pred_loss, "dynamics loss": dyn_loss, "representation loss": "rep_loss"}
+        
     
     def prediction_loss(self, obs, reconstruction, reward, reward_probs, dones, continue_prediction):
         reconstruction_error = symlog_squared_error(obs, reconstruction)
