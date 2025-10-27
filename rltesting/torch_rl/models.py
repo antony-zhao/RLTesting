@@ -13,7 +13,7 @@ def compute_pad(kernel_size, stride):
 
 class MLP(nn.Module):
     # if hidden dims is specified then doesn't use skip connections
-    def __init__(self, input_dim, output_dim, hidden_dim=256, num_hiddens=2, act=nn.SiLU, hidden_dims=None):
+    def __init__(self, input_dim, output_dim, hidden_dim=256, num_hiddens=2, act=nn.SiLU, hidden_dims=None, final_act=None):
         super().__init__()
         if hidden_dims is not None:
             assert len(hidden_dims) + 1 == num_hiddens
@@ -32,6 +32,7 @@ class MLP(nn.Module):
         self.hiddens = nn.ModuleList(self.hiddens)
         self.output_layer = nn.Linear(hidden_dim, output_dim)
         self.act = act()
+        self.final_act = final_act
     
     def forward(self, x):
         x = self.act(self.input_layer(x))
@@ -41,6 +42,8 @@ class MLP(nn.Module):
             else:
                 x = self.act(self.hiddens[i](x))
         logits = self.output_layer(x)
+        if self.final_act is not None:
+            return self.final_act(logits)
         return logits
 
 class ResBlock(nn.Module):

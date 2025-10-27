@@ -4,7 +4,7 @@ from rltesting.torch_rl.models import AtariConv
 from gymnasium import Wrapper
 
 class BasicEnvironmentRGB(Wrapper):
-    def __init__(self, env, obs_shape=(128, 128)):
+    def __init__(self, env, obs_shape=(64, 64)):
         super().__init__(env)
         # make sure the render_mode is rgb_array
         self.env = env

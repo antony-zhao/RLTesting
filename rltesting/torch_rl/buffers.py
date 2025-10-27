@@ -84,4 +84,4 @@ class PerEnvBuffer:
         for i in range(self.num_items):
             samples.append(np.concatenate([sample[i] for sample in per_env_samples], axis=0 if seq_len == 1 else 1))
         
-        
+        return samples
