@@ -1,4 +1,7 @@
 import numpy as np
+import torch
+
+to_numpy = lambda x: x.detach().cpu().numpy()
 
 class EMA:
     pass

@@ -19,12 +19,14 @@ class ReplayBuffer:
     
     def sample(self, batch_size, seq_len=1):
         if self.weights is None:
-            indices = np.random.randint(0, min(self.total, self.buffer_size), size=batch_size)
+            indices = np.random.randint(0, min(self.total - seq_len, self.buffer_size), size=batch_size)
         if seq_len > 1:
             indices = np.expand_dims(indices, axis=-1) + np.arange(seq_len)
             indices %= self.buffer_size
             indices = indices.transpose()
         sampled = [buffer[indices] for buffer in self.buffers]
+        if batch_size > 0  and sampled[1].max() >= 18:
+            print('hi')
         return sampled
     
     def add_sample(self, sample):

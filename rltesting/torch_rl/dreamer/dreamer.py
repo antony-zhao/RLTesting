@@ -4,6 +4,7 @@ import numpy as np
 import torch.nn.functional as F
 from rltesting.torch_rl.models import DreamerDecoderConv, DreamerEncoderConv, MLP, NormAndAct, DreamerGRU
 from rltesting.torch_rl.dreamer.utils import *
+from rltesting.utils.torch_utils import to_numpy
 import argparse
 from functools import partial
 from torch.distributions import OneHotCategoricalStraightThrough, Independent, Categorical, Normal, kl_divergence
@@ -33,11 +34,10 @@ class DreamerEncoder(nn.Module):
         encoded = self.encoder(x)
         encoded = torch.flatten(encoded, 1)
         x = torch.cat([encoded, h], 1)
-        latent = self.out(x)
-        latent = latent.reshape(latent.shape[0], self.num_categoricals, self.num_codes)
-        unimixed_probs = unimix(latent, self.num_codes, self.config.latent_unimix)
-        logits = F.softmax(unimixed_probs, -1)
-        return logits#, unimixed_probs
+        logits = self.out(x)
+        probs = F.softmax(logits.reshape(logits.shape[0], self.num_categoricals, self.num_codes), -1)
+        unimixed_probs = unimix(probs, self.num_codes, self.config.latent_unimix)
+        return unimixed_probs
 
 class DreamerDecoder(nn.Module):
     # if obs_type isn't image then input_dim should be specified
@@ -90,9 +90,10 @@ class DreamerWorldModel(nn.Module):
         self.rssm = RSSM(config)
         self.dynamics_predictor = MLP(config.hidden_state_size, config.latent_size, config.hidden_dim, config.num_hiddens, mlp_norm_act(config.hidden_dim, config.act))
         self.reward_predictor = MLP(config.state_size, config.num_bins, config.hidden_dim, config.num_hiddens, mlp_norm_act(config.hidden_dim, config.act), final_act=nn.Softmax(-1))
-        self.continue_predictor = MLP(config.state_size, 1, config.hidden_dim, config.num_hiddens, mlp_norm_act(config.hidden_dim, config.act), final_act=nn.Sigmoid())
+        self.continue_predictor = MLP(config.state_size, 1, config.hidden_dim, config.num_hiddens, mlp_norm_act(config.hidden_dim, config.act))
         self.rollout_length = config.rollout_length
         self.config = config
+        self.bins = torch.linspace(config.bin_low, config.bin_high, config.num_bins).to(config.device)
     
     def imagine_step(self, hidden, latent, action):
         # treat this like how you would a normal environment step
@@ -136,8 +137,9 @@ class DreamerWorldModel(nn.Module):
         reconstructions = []
         continue_preds = []
         reward_probs = []
-        for i in range(self.rollout_length):
-            probs_enc = self.encoder(obs[i], hidden)
+        for i in range(obs.shape[0]):
+            transformed_obs = symlog(obs / 255 - 0.5)
+            probs_enc = self.encoder(transformed_obs[i], hidden)
             latent_enc = Independent(OneHotCategoricalStraightThrough(probs_enc), 1).rsample()
             enc_probs.append(probs_enc)
             logits_dyn = self.dynamics_predictor(hidden)
@@ -160,19 +162,23 @@ class DreamerWorldModel(nn.Module):
         reconstructions = torch.stack(reconstructions)
         continue_preds = torch.stack(continue_preds)
         reward_probs = torch.stack(reward_probs)
-        pred_loss = self.prediction_loss(obs, reconstructions, rewards, reward_probs, dones, continue_preds)
+        pred_loss, loss_dict = self.prediction_loss(obs / 255 - 0.5, reconstructions, rewards, reward_probs, dones, continue_preds)
         dyn_loss = self.dynamics_loss(enc_probs, dyn_probs)
         rep_loss = self.representation_loss(enc_probs, dyn_probs)
         loss = pred_loss * self.config.prediction_loss_coeff + dyn_loss * self.config.dynamics_loss_coeff + rep_loss * self.config.representation_loss_coeff
-        return loss, {"prediction loss": pred_loss, "dynamics loss": dyn_loss, "representation loss": rep_loss}
+        loss_dict["KL divergence"] = to_numpy(dyn_loss)
+        return loss, loss_dict
         
     
     def prediction_loss(self, obs, reconstruction, reward, reward_probs, dones, continue_prediction):
         reconstruction_error = symlog_squared_error(obs, reconstruction)
-        reward_prediction = WeightedAverageOverBins(reward_probs.flatten(0, 1), low=self.config.bin_low, high=self.config.bin_high, num_bins=self.config.num_bins)
+        reward_prediction = WeightedAverageOverBins(self.bins, reward_probs.flatten(0, 1))
         reward_error = reward_prediction.log_prob(reward.flatten())
-        continue_error = F.binary_cross_entropy((1 - dones), continue_prediction.squeeze(-1))
-        return reconstruction_error - reward_error + continue_error
+        continue_error = F.binary_cross_entropy_with_logits((1 - dones), continue_prediction.squeeze(-1), reduction="mean")
+        total_loss = reconstruction_error - reward_error + continue_error
+        return total_loss, {"reconstruction_loss": to_numpy(reconstruction_error), 
+                                                                      "reward_loss": to_numpy(-reward_error), 
+                                                                      "continue_loss": to_numpy(continue_error)}
     
     def dynamics_loss(self, probs_enc, probs_dyn):
         latent_enc = Independent(OneHotCategoricalStraightThrough(probs_enc.detach()), 1)

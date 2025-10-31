@@ -13,17 +13,15 @@ def symexp(x):
     return torch.sign(x) * (torch.exp(torch.abs(x)) - 1)
 
 def symlog_squared_error(y, y_hat):
-    return (1/2 * (symlog(y) - y_hat) ** 2).mean()
+    return F.mse_loss(symlog(y), y_hat)
 
 def sample_latent(probs):
     pass
 
 class WeightedAverageOverBins:
-    def __init__(self, probs=None, logits=None, low=-20, num_bins=255, high=20, forward=symexp, backward=symlog):
+    def __init__(self, bins, probs=None, logits=None, forward=symexp, backward=symlog):
         self.probs = torch.softmax(logits, -1) if probs is None else probs
-        self.bins = torch.linspace(low, high, num_bins)
-        self.low = low
-        self.high = high
+        self.bins = bins
         self.forward = forward
         self.backward = backward
     
@@ -46,5 +44,5 @@ class WeightedAverageOverBins:
     def log_prob(self, vals):
         # basically just the loss
         target = self.two_hot(self.backward(vals))
-        return (-target * torch.log(self.probs)).sum(-1).mean()
+        return (target * torch.log(self.probs)).sum(-1).mean()
     
