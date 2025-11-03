@@ -13,7 +13,7 @@ def symexp(x):
     return torch.sign(x) * (torch.exp(torch.abs(x)) - 1)
 
 def symlog_squared_error(y, y_hat):
-    return F.mse_loss(symlog(y), y_hat)
+    return (0.5 * (symlog(y) - y_hat) ** 2).sum(-1).mean()
 
 def sample_latent(probs):
     pass

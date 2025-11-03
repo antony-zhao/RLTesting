@@ -2,6 +2,7 @@ from torch import nn
 import torch
 import numpy as np
 import torch.nn.functional as F
+import copy
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
@@ -184,5 +185,25 @@ class DreamerGRU(nn.Module):
         return h_new
 
 class TargetNetwork(nn.Module):
-    def __init__(self, original_network):
-        pass
+    # TODO need to verify if this will keep a pointer to the original network or just a copy, I'm assuming pointer
+    def __init__(self, original_network, tau=None, update_freq=None):
+        self.original = original_network
+        self.network = copy.deepcopy(original_network)
+        if tau is None and update_freq is None:
+            raise RuntimeError("At least one of tau or update frequency should be specified")
+        self.tau = tau # esentially the moving average, slowly updates every time
+        self.update_freq = update_freq
+        self.i = 0
+        
+    def update(self):
+        if self.tau is not None:
+            for key in self.original.state_dict():
+                self.network[key] = self.original[key] * self.tau + self.network[key] * (1 - self.tau)
+        else:
+            self.i += 1
+            if (self.i % self.update_freq) == 0:
+                self.network = copy.deepcopy(self.original)
+    
+    def forward(self, x):
+        # since this target should never be updated by gradients
+        return self.network(x).detach()

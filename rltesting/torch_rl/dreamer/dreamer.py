@@ -2,12 +2,14 @@ from torch import nn
 import torch
 import numpy as np
 import torch.nn.functional as F
-from rltesting.torch_rl.models import DreamerDecoderConv, DreamerEncoderConv, MLP, NormAndAct, DreamerGRU
+from rltesting.torch_rl.models import DreamerDecoderConv, DreamerEncoderConv, MLP, NormAndAct, DreamerGRU, TargetNetwork
 from rltesting.torch_rl.dreamer.utils import *
 from rltesting.utils.torch_utils import to_numpy
+from rltesting.torch_rl.buffers import PerEnvBuffer
 import argparse
 from functools import partial
-from torch.distributions import OneHotCategoricalStraightThrough, Independent, Categorical, Normal, kl_divergence
+from torch.distributions import OneHotCategoricalStraightThrough, Independent, Categorical, Normal, kl_divergence, Bernoulli
+
 
 mlp_norm_act = lambda dim, act: partial(NormAndAct, norm_dim=dim, act=act)
 
@@ -31,10 +33,18 @@ class DreamerEncoder(nn.Module):
     
     def forward(self, x, h):
         # x as in the observation specifically, h is the same hidden state
+        embedded = self.embed_observations(x)
+        state = torch.cat([embedded, h], 1)
+        return self.compute_latent(state)
+    
+    def embed_observations(self, x):
+        # since the encoder computation can be batched without needing to incorporate the hidden state
         encoded = self.encoder(x)
-        encoded = torch.flatten(encoded, 1)
-        x = torch.cat([encoded, h], 1)
-        logits = self.out(x)
+        encoded = torch.flatten(encoded, -3)
+        return encoded
+    
+    def compute_latent(self, states):
+        logits = self.out(states)
         probs = F.softmax(logits.reshape(logits.shape[0], self.num_categoricals, self.num_codes), -1)
         unimixed_probs = unimix(probs, self.num_codes, self.config.latent_unimix)
         return unimixed_probs
@@ -90,9 +100,10 @@ class DreamerWorldModel(nn.Module):
         self.rssm = RSSM(config)
         self.dynamics_predictor = MLP(config.hidden_state_size, config.latent_size, config.hidden_dim, config.num_hiddens, mlp_norm_act(config.hidden_dim, config.act))
         self.reward_predictor = MLP(config.state_size, config.num_bins, config.hidden_dim, config.num_hiddens, mlp_norm_act(config.hidden_dim, config.act), final_act=nn.Softmax(-1))
-        self.continue_predictor = MLP(config.state_size, 1, config.hidden_dim, config.num_hiddens, mlp_norm_act(config.hidden_dim, config.act))
+        self.continue_predictor = MLP(config.state_size, 1, config.hidden_dim, config.num_hiddens, mlp_norm_act(config.hidden_dim, config.act), final_act=nn.Sigmoid())
         self.rollout_length = config.rollout_length
         self.config = config
+        self.is_image = self.config.obs_type == "image"
         self.bins = torch.linspace(config.bin_low, config.bin_high, config.num_bins).to(config.device)
     
     def imagine_step(self, hidden, latent, action):
@@ -137,8 +148,10 @@ class DreamerWorldModel(nn.Module):
         reconstructions = []
         continue_preds = []
         reward_probs = []
+        if self.is_image:
+            obs = obs / 255.0 - 0.5
+        transformed_obs = symlog(obs / 255 - 0.5)
         for i in range(obs.shape[0]):
-            transformed_obs = symlog(obs / 255 - 0.5)
             probs_enc = self.encoder(transformed_obs[i], hidden)
             latent_enc = Independent(OneHotCategoricalStraightThrough(probs_enc), 1).rsample()
             enc_probs.append(probs_enc)
@@ -155,30 +168,29 @@ class DreamerWorldModel(nn.Module):
             reward_probs.append(reward_prob)
             continue_pred = self.continue_predictor(state)
             continue_preds.append(continue_pred)
-            if i < self.rollout_length - 1:
-                hidden = self.rssm(hidden, latent_enc, actions[i])
+            hidden = self.rssm(hidden, latent_enc, actions[i])
         enc_probs = torch.stack(enc_probs)
         dyn_probs = torch.stack(dyn_probs)
         reconstructions = torch.stack(reconstructions)
         continue_preds = torch.stack(continue_preds)
         reward_probs = torch.stack(reward_probs)
-        pred_loss, loss_dict = self.prediction_loss(obs / 255 - 0.5, reconstructions, rewards, reward_probs, dones, continue_preds)
+        pred_loss, loss_dict = self.prediction_loss(obs, reconstructions, rewards, reward_probs, dones, continue_preds)
         dyn_loss = self.dynamics_loss(enc_probs, dyn_probs)
         rep_loss = self.representation_loss(enc_probs, dyn_probs)
-        loss = pred_loss * self.config.prediction_loss_coeff + dyn_loss * self.config.dynamics_loss_coeff + rep_loss * self.config.representation_loss_coeff
+        loss = pred_loss * self.config.prediction_loss_coef + dyn_loss * self.config.dynamics_loss_coef + rep_loss * self.config.representation_loss_coef
         loss_dict["KL divergence"] = to_numpy(dyn_loss)
         return loss, loss_dict
-        
     
-    def prediction_loss(self, obs, reconstruction, reward, reward_probs, dones, continue_prediction):
-        reconstruction_error = symlog_squared_error(obs, reconstruction)
+    def prediction_loss(self, obs, reconstruction, reward, reward_probs, dones, continue_probs):
+        reconstruction_error = symlog_squared_error(obs.flatten(2), reconstruction.flatten(2))
         reward_prediction = WeightedAverageOverBins(self.bins, reward_probs.flatten(0, 1))
         reward_error = reward_prediction.log_prob(reward.flatten())
-        continue_error = F.binary_cross_entropy_with_logits((1 - dones), continue_prediction.squeeze(-1), reduction="mean")
-        total_loss = reconstruction_error - reward_error + continue_error
+        continue_dist = Independent(Bernoulli(continue_probs.squeeze(-1)), 1)
+        continue_error = continue_dist.log_prob(1 - dones).mean()
+        total_loss = reconstruction_error - reward_error - continue_error
         return total_loss, {"reconstruction_loss": to_numpy(reconstruction_error), 
                                                                       "reward_loss": to_numpy(-reward_error), 
-                                                                      "continue_loss": to_numpy(continue_error)}
+                                                                      "continue_loss": to_numpy(-continue_error)}
     
     def dynamics_loss(self, probs_enc, probs_dyn):
         latent_enc = Independent(OneHotCategoricalStraightThrough(probs_enc.detach()), 1)
@@ -207,32 +219,16 @@ class Actor(nn.Module):
         return action_dist
     
     def policy_fn(self, x, det=False):
-        # actually choosing the action, returns the actual action as well as the log prob of the action
+        # actually choosing the action, returns the actual action as well as the log prob of the action and entropy
+        action_dist = self.policy_dist(x)
         if not det:
-            action_dist = self.policy_dist(x)
+            if self.action_type == "discrete":
+                action = action_dist.sample()
+            else:
+                action = action_dist.rsample()
         else:
-            action_mean = self.mlp(x)
-            return action_mean, None, None
+            return action_dist.mode()
         
-        if self.action_type == "discrete":
-            action = action_dist.sample()
-        else:
-            action = action_dist.rsample()
-            
-        return action, action_dist.log_prob(action).sum(-1), action_dist.entropy()
-    
-    def choose_action(self, x, det=False):
-        if not det:
-            action_dist = self.policy_dist(x)
-        else:
-            action_mean = self.mlp(x)
-            return action_mean
-        
-        if self.action_type == "discrete":
-            action = action_dist.sample()
-        else:
-            action = action_dist.rsample()
-            
         return action
     
 class Critic(nn.Module):
@@ -248,33 +244,77 @@ class Critic(nn.Module):
 
 class DreamerV3:
     def __init__(self, config):
+        self.config = config
         self.world_model = DreamerWorldModel(config)
         self.actor = Actor(config)
         self.critic = Critic(config)
+        self.critic_target = TargetNetwork(self.critic)
         self.optim_wm = None
         self.optim_actor = None
         self.optim_critic = None
         # decide whether or not to leave the optimizers in here, if so it might be good to modify some of the other classes to follow a similar 
         # pattern but then again dreamer is so much more different it might be fine
-        self.buffer = None
+        self.buffer = PerEnvBuffer(config.num_envs, [], buffer_size=1_000_000)
         # buffer needs to account for order in episodes
         self.active_history = torch.zeros(config.num_envs, config.hidden_state_size)
+        # the history for the environment itself, keeping track of it in here since it would be a bit weird to have this be in the main part of the program
+        
+        self.range_ema = None
+        self.return_range_tau = config.return_range_tau
+        # Used for calculating the range of returns to help normalize the reinforce gradient
+        
+        self.gamma = config.gamma
+        self.lambda_ = config.lambda_
     
-    def train_world_model(self):
-        pass
+    def train_world_model(self, obs, actions, rewards, dones, hidden):
+        loss, loss_dict = self.world_model.world_model_loss(obs, actions, rewards, dones, hidden)
+        return loss, loss_dict
     
-    def train_actor_critic(self):
-        pass
+    def train_actor(self, states, actions, returns, values):
+        action_dists = self.actor.policy_dist(states)
+        action_log_probs = action_dists.log_prob(actions)
+        action_entropy = action_dists.entropy(actions)
+        range = torch.quantile(returns, 0.95) - torch.quantile(returns, 0.05)
+        if self.range_ema is not None:
+            self.range_ema = range * self.return_range_tau + self.range_ema * (1 - self.return_range_tau)
+        else:
+            self.range_ema = range
+        actor_loss = -torch.sum((returns - values).detach() / torch.clip(self.range_ema, min=1) * action_log_probs + action_entropy)
+        return actor_loss
+        
     
-    def env_step(self):
-        # given the observation in the environment choose an action and do a step, as well as storing everything inside the buffer
+    def train_critic(self, states, rewards, dones):
+        values, value_bins = self.critic(states)
+        value_target, _ = self.critic_target(states)
+        continues = (1 - dones)
+        returns = torch.empty_like(value_target)
+        for i in range(reversed(len(states))):
+            if i < len(states) - 1:
+                returns[i] = rewards[i] + self.gamma * continues[i] * ((1 - self.lambda_) * value_target[i] + self.lambda_ * returns[i + 1])
+            else:
+                returns[i] = value_target[-1]
+        loss = value_bins.log_prob(returns)
+        return loss, returns, values # returning returns and values for the actor to reuse later
+    
+    def actor_choose(self, obs):
+        latent = self.world_model.forward(obs, self.active_history)
+        action = self.actor.choose_action(latent)
+        return action
+    
+    def process_sample(self, obs, action, reward, next_obs, done):
+        # do a step in RSSM and store stuff in buffer
         pass
+        
+    def checkpoint_models(self, folderpath, filename):
+        torch.save(self.world_model.state_dict(), f"{folderpath}/world_model-{filename}.pth")
+        torch.save(self.actor.state_dict(), f"{folderpath}/actor-{filename}.pth")
+        torch.save(self.actor.state_dict(), f"{folderpath}/critic-{filename}.pth")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="just a temporary argparse while I debug the world model, will be moved elsewhere later")
     # specified for Atari specifically by default and using the 200M size model for Dreamer
-    parser.add_argument("--obs_type", default="image", choices=["image", "vector"])
+    parser.add_argument("--obs_type", default="image", choices=["image", "vector", "multi"])
     encoder_parser = parser.add_argument_group("encoder")
     vector_parser = parser.add_argument_group("vector")
     world_model_parser = parser.add_argument_group("world_model")
@@ -294,15 +334,20 @@ if __name__ == "__main__":
     world_model_parser.add_argument("--latent_unimix", default=0.01, type=float)
     world_model_parser.add_argument("--use_block_linear", default=True, type=bool)
     world_model_parser.add_argument("--act", default="silu", choices=["silu", "gelu", "relu"])
-    world_model_parser.add_argument("--prediction_loss_coeff", default=1, type=float)
-    world_model_parser.add_argument("--dynamics_loss_coeff", default=1, type=float)
-    world_model_parser.add_argument("--representation_loss_coeff", default=0.1, type=float)
+    world_model_parser.add_argument("--prediction_loss_coef", default=1, type=float)
+    world_model_parser.add_argument("--dynamics_loss_coef", default=1, type=float)
+    world_model_parser.add_argument("--representation_loss_coef", default=0.1, type=float)
     world_model_parser.add_argument("--free_nats", default=1, type=float)
     world_model_parser.add_argument("--bin_low", default=-20, type=int)
     world_model_parser.add_argument("--bin_high", default=20, type=int)
     world_model_parser.add_argument("--num_bins", default=255, type=int)
     parser.add_argument("--rollout_length", default=16, type=int)
     parser.add_argument("--num_envs", default=30, type=int)
+    parser.add_argument("--critic_tau", default=0.02, type=float)
+    parser.add_argument("--entropy_coef")
+    parser.add_argument("--return_range_tau", default=0.01, type=1)
+    parser.add_argument("--gamma", default=0.997, type=float)
+    parser.add_argument("--lambda_", default=0.95, type=float)
     config = parser.parse_args()
     if config.act == "silu":
         config.act = nn.SiLU
