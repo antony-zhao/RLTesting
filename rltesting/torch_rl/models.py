@@ -187,8 +187,11 @@ class DreamerGRU(nn.Module):
 class TargetNetwork(nn.Module):
     # TODO need to verify if this will keep a pointer to the original network or just a copy, I'm assuming pointer
     def __init__(self, original_network, tau=None, update_freq=None):
+        super().__init__()
         self.original = original_network
         self.network = copy.deepcopy(original_network)
+        for param in self.network.parameters():
+            param.requires_grad = False
         if tau is None and update_freq is None:
             raise RuntimeError("At least one of tau or update frequency should be specified")
         self.tau = tau # esentially the moving average, slowly updates every time
@@ -206,4 +209,4 @@ class TargetNetwork(nn.Module):
     
     def forward(self, x):
         # since this target should never be updated by gradients
-        return self.network(x).detach()
+        return self.network(x)

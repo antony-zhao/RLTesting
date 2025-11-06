@@ -1,4 +1,5 @@
 import torch
+from torch import nn
 import torch.nn.functional as F
 import numpy as np
 
@@ -15,8 +16,12 @@ def symexp(x):
 def symlog_squared_error(y, y_hat):
     return (0.5 * (symlog(y) - y_hat) ** 2).sum(-1).mean()
 
-def sample_latent(probs):
-    pass
+def init_last_layer(model, init_func):
+    # init func should be a partial func with everything already specified, might be a better way to do it but this is just what I know
+    for module in model.modules():
+        if isinstance(module, (nn.Linear, nn.Conv2d)):
+            last_layer = module
+    init_func(last_layer.weight)
 
 class WeightedAverageOverBins:
     def __init__(self, bins, probs=None, logits=None, forward=symexp, backward=symlog):
@@ -30,7 +35,7 @@ class WeightedAverageOverBins:
         return self.forward(weighted_average)
     
     def two_hot(self, vals):
-        index_1 = (self.bins.repeat(vals.shape[0], 1) < vals.unsqueeze(1)).sum(-1) - 1
+        index_1 = (self.bins.expand(vals.shape + (-1,)) < vals.unsqueeze(-1)).sum(-1) - 1
         index_2 = index_1 + 1
         b_k = self.bins[index_1]
         b_k2 = self.bins[index_2]

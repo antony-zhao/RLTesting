@@ -1,4 +1,5 @@
 import numpy as np
+import torch
 
 class ReplayBuffer:
     # The vanilla replay buffer
@@ -18,8 +19,14 @@ class ReplayBuffer:
         self.done_index = done_index
     
     def sample(self, batch_size, seq_len=1):
+        # can do a thing where the valid indices go from [0, pos - seq_len) and [pos, buffer_size-seq_len] to prevent the
+        # out of order sampling, instead of needing to wait for episode to terminate
         if self.weights is None:
-            indices = np.random.randint(0, min(self.total - seq_len, self.buffer_size), size=batch_size)
+            if self.total < self.buffer_size:
+                indices = np.random.randint(0, min(self.total - seq_len, self.buffer_size), size=batch_size)
+            else:
+                valid_indices = list(range(0, self.index - seq_len)) + list(range(self.index, self.buffer_size))
+                indices = np.random.choice(valid_indices, size=batch_size)
         if seq_len > 1:
             indices = np.expand_dims(indices, axis=-1) + np.arange(seq_len)
             indices %= self.buffer_size
@@ -36,7 +43,8 @@ class ReplayBuffer:
         self.total += 1
     
     def add_sample_until_episode_terminal(self, sample):
-        # use if the ordering of the data matters (i.e. recurrent) so that there won't be a weird transition between an incomplete and an old episode.
+        # use if the ordering of the data matters (i.e. recurrent) so that there won't be a weird 
+        # transition between an incomplete and an old episode.
         for i in range(len(self.buffers)):
             self.temp_buffer[i].append(sample[i])
         if sample[-1]:
@@ -87,3 +95,10 @@ class PerEnvBuffer:
             samples.append(np.concatenate([sample[i] for sample in per_env_samples], axis=0 if seq_len == 1 else 1))
         
         return samples
+    
+    def sample_as_tensors(self, device, batch_size, seq_len=1):
+        samples = self.sample(batch_size, seq_len)
+        
+        samples_tensor = [torch.tensor(sample).to(device).float() for sample in samples]
+        return samples_tensor
+        
