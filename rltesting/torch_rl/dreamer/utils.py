@@ -22,6 +22,7 @@ def init_last_layer(model, init_func):
         if isinstance(module, (nn.Linear, nn.Conv2d)):
             last_layer = module
     init_func(last_layer.weight)
+    last_layer.bias.data.fill_(0.0)
 
 class WeightedAverageOverBins:
     def __init__(self, bins, probs=None, logits=None, forward=symexp, backward=symlog):

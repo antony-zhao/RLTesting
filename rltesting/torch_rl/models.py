@@ -14,7 +14,7 @@ def compute_pad(kernel_size, stride):
 
 class MLP(nn.Module):
     # if hidden dims is specified then doesn't use skip connections
-    def __init__(self, input_dim, output_dim, hidden_dim=256, num_hiddens=2, act=nn.SiLU, hidden_dims=None, final_act=None):
+    def __init__(self, input_dim, output_dim, hidden_dim=256, num_hiddens=2, act=nn.SiLU, hidden_dims=None, final_act=None, use_bias_hidden=True, use_bias_final=True):
         super().__init__()
         if hidden_dims is not None:
             assert len(hidden_dims) + 1 == num_hiddens
@@ -22,16 +22,16 @@ class MLP(nn.Module):
             self.skip_connections = False
         else:
             self.skip_connections = True
-        self.input_layer = nn.Linear(input_dim, hidden_dim)
+        self.input_layer = nn.Linear(input_dim, hidden_dim, bias=use_bias_hidden)
         self.hiddens = []
         for i in range(num_hiddens):
             if hidden_dims is None:
-                self.hiddens.append(nn.Linear(hidden_dim, hidden_dim))
+                self.hiddens.append(nn.Linear(hidden_dim, hidden_dim, bias=use_bias_hidden))
             else:
-                self.hiddens.append(nn.Linear(hidden_dim, hidden_dims[i + 1]))
+                self.hiddens.append(nn.Linear(hidden_dim, hidden_dims[i + 1], bias=use_bias_hidden))
                 hidden_dim = hidden_dims[i + 1]
         self.hiddens = nn.ModuleList(self.hiddens)
-        self.output_layer = nn.Linear(hidden_dim, output_dim)
+        self.output_layer = nn.Linear(hidden_dim, output_dim, bias=use_bias_final)
         self.act = act()
         self.final_act = final_act
     
@@ -128,7 +128,7 @@ class DreamerEncoderConv(nn.Module):
         filters = [filter_base * 2 ** i for i in range(num_convs)]
         layers = []
         for i, filter in enumerate(filters):
-            layers.append(nn.Conv2d(image_channels if i == 0 else filters[i - 1], filter, kernel_size, 2, padding=compute_pad(kernel_size, 2)))
+            layers.append(nn.Conv2d(image_channels if i == 0 else filters[i - 1], filter, kernel_size, 2, padding=compute_pad(kernel_size, 2), bias=False))
             if i < len(filters) - 1:
                 layers.append(NormAndAct(filter, norm, act))
         self.layers = nn.Sequential(*layers)
@@ -145,7 +145,7 @@ class DreamerDecoderConv(nn.Module):
         filters = [filter_base * 2 ** i for i in reversed(range(num_convs))]
         layers = []
         for i, filter in enumerate(filters):
-            layers.append(nn.ConvTranspose2d(filter, image_channels if i == len(filters) - 1 else filters[i + 1], kernel_size, 2, padding=compute_pad(kernel_size, 2)))
+            layers.append(nn.ConvTranspose2d(filter, image_channels if i == len(filters) - 1 else filters[i + 1], kernel_size, 2, padding=compute_pad(kernel_size, 2), bias=False))
             if i < len(filters) - 1:
                 layers.append(NormAndAct(image_channels if i == len(filters) - 1 else filters[i + 1], norm, act))
         self.layers = nn.Sequential(*layers)
@@ -188,7 +188,6 @@ class TargetNetwork(nn.Module):
     # TODO need to verify if this will keep a pointer to the original network or just a copy, I'm assuming pointer
     def __init__(self, original_network, tau=None, update_freq=None):
         super().__init__()
-        self.original = original_network
         self.network = copy.deepcopy(original_network)
         for param in self.network.parameters():
             param.requires_grad = False
@@ -198,14 +197,17 @@ class TargetNetwork(nn.Module):
         self.update_freq = update_freq
         self.i = 0
         
-    def update(self):
+    def update(self, original):
+        target_net_state_dict = self.network.state_dict()
+        original_net_state_dict = original.state_dict()
         if self.tau is not None:
-            for key in self.original.state_dict():
-                self.network[key] = self.original[key] * self.tau + self.network[key] * (1 - self.tau)
+            for key in original_net_state_dict:
+                target_net_state_dict[key] = original_net_state_dict[key] * self.tau + target_net_state_dict[key] * (1 - self.tau)
+            self.network.load_state_dict(target_net_state_dict)
         else:
             self.i += 1
             if (self.i % self.update_freq) == 0:
-                self.network = copy.deepcopy(self.original)
+                self.network = copy.deepcopy(original)
     
     def forward(self, x):
         # since this target should never be updated by gradients
