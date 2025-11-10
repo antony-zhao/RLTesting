@@ -14,7 +14,7 @@ def compute_pad(kernel_size, stride):
 
 class MLP(nn.Module):
     # if hidden dims is specified then doesn't use skip connections
-    def __init__(self, input_dim, output_dim, hidden_dim=256, num_hiddens=2, act=nn.SiLU, hidden_dims=None, final_act=None, use_bias_hidden=True, use_bias_final=True):
+    def __init__(self, input_dim, output_dim, hidden_dim=256, num_hiddens=2, act=nn.SiLU, hidden_dims=None, final_act=None, use_bias_hidden=True, use_bias_final=True, skip_connections=None):
         super().__init__()
         if hidden_dims is not None:
             assert len(hidden_dims) + 1 == num_hiddens
@@ -22,6 +22,8 @@ class MLP(nn.Module):
             self.skip_connections = False
         else:
             self.skip_connections = True
+        if skip_connections is not None:
+            self.skip_connections = skip_connections
         self.input_layer = nn.Linear(input_dim, hidden_dim, bias=use_bias_hidden)
         self.hiddens = []
         for i in range(num_hiddens):
@@ -120,6 +122,10 @@ class NormAndAct(nn.Module):
     
     def forward(self, x):
         return self.act(x)
+
+class DreamerMLP(nn.Module):
+    def __init__(self, input_dim, output_dim, hidden_size, num_hiddens, act=nn.SiLU):
+        pass
 
 class DreamerEncoderConv(nn.Module):
     # built for 64x64 observations and downscales them to 4x4, can do other sizes but would need to be changed a bit
