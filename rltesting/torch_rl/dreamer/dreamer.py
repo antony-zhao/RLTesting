@@ -60,8 +60,8 @@ class DreamerDecoder(nn.Module):
         self.obs_type = config.obs_type
         if config.obs_type == "image":
             self.input_dim = config.output_dim
-            self._in = MLP(config.state_size, np.prod(self.input_dim), config.hidden_dim, 
-                       num_hiddens=config.num_hiddens_world_model, act=mlp_norm_act(config.hidden_dim, config.act), use_bias_hidden=False, skip_connections=False)
+            self._in = nn.Linear(config.state_size, np.prod(self.input_dim)) #MLP(config.state_size, np.prod(self.input_dim), config.hidden_dim, 
+                       #num_hiddens=config.num_hiddens_world_model, act=mlp_norm_act(config.hidden_dim, config.act), use_bias_hidden=False, skip_connections=False)
             self.decoder = DreamerDecoderConv(config.filter_base, config.num_convs, config.kernel_size, config.num_channels, config.act)
         else:
             self._in = nn.Linear(config.hidden_state_size + config.num_categoricals * config.num_codes, config.hidden_dim)
@@ -142,35 +142,38 @@ class DreamerWorldModel(nn.Module):
             next_latent = Independent(OneHotCategoricalStraightThrough(probs_dyn), 1).rsample()
         return (next_latent, next_hidden), reward, continue_
     
-    def dynamic_step(self, obs_embedding, action, hidden, done, is_first):
+    def dynamic_step(self, obs_embedding, action, hidden, latent, is_first):
         # following a similar way the way sheeprl implements this but also not exactly the same
-        initial_hidden = self._get_hidden(action.shape[0])
-        if is_first:
-            hidden = initial_hidden
+        # initial_hidden = self._get_hidden(action.shape[0])
+        h_0 = torch.tanh(self.initial_hidden.expand(action.shape[0], -1))
+        logits_dyn = self.dynamics_predictor(h_0)
+        logits_dyn = logits_dyn.reshape(-1, self.config.num_categoricals, self.config.num_codes)
+        z_0 = Independent(OneHotCategoricalStraightThrough(logits=logits_dyn), 1).mode
+        # if is_first:
+        #     hidden = initial_hidden
+        action = (1 - is_first) * action
+        hidden = (1 - is_first) * hidden + is_first * h_0
+        latent = (1 - is_first) * latent.flatten(-2) + is_first * z_0.flatten(-2)
+        hidden = self.rssm(latent, hidden, action)
         probs_enc, latent_enc, probs_dyn = self.compute_latents(obs_embedding, hidden)
         state = make_state(latent_enc, hidden)
-        reward_prob = self.reward_predictor(state)
-        continue_pred = self.continue_predictor(state)
-        done = done.unsqueeze(-1)
-        next_hidden = self.rssm(latent_enc.flatten(-2), hidden, action) * (1 - done) + done * initial_hidden
-        return probs_enc, probs_dyn, reward_prob, continue_pred, state, next_hidden
+        # next_hidden = self.rssm(latent_enc.flatten(-2), hidden, action) * (1 - done) + done * initial_hidden
+        return probs_enc, probs_dyn, state, hidden, latent_enc
     
     def _get_hidden(self, batch_size):
         h_0 = torch.tanh(self.initial_hidden.expand(batch_size, -1))
         logits_dyn = self.dynamics_predictor(h_0)
         logits_dyn = logits_dyn.reshape(-1, self.config.num_categoricals, self.config.num_codes)
-        probs_dyn = torch.softmax(logits_dyn, -1)
-        probs_dyn = unimix(probs_dyn, self.config.num_codes, self.config.latent_unimix)
-        z_0 = Independent(OneHotCategoricalStraightThrough(probs_dyn), 1).mode
+        z_0 = Independent(OneHotCategoricalStraightThrough(logits=logits_dyn), 1).mode
         return self.rssm(z_0.flatten(-2), h_0, torch.zeros(batch_size, self.config.action_dim).to(self.config.device))
     
-    def recurrent_step(self, hidden, latent, action):
+    def recurrent_step (self, hidden, latent, action):
         if self.config.action_type == "discrete":
             action = F.one_hot(action, self.config.action_dim).float()
         next_hidden = self.rssm(latent.flatten(-2), hidden, action)
         return next_hidden
     
-    def world_model_loss(self, obs, actions, rewards, dones, hidden):
+    def world_model_loss(self, obs, actions, rewards, dones):
         enc_probs = []
         dyn_probs = []
         continue_preds = []
@@ -182,27 +185,33 @@ class DreamerWorldModel(nn.Module):
         T, B, C, H, W = transformed_obs.shape
         obs_embeddings = self.encoder.embed_observations(transformed_obs.reshape(T * B, C, H, W))
         obs_embeddings = obs_embeddings.reshape(T, B, -1)
+        is_first = torch.zeros_like(dones)
+        is_first[1:] = dones[:-1]
+        is_first[0] = torch.ones_like(is_first[0])
+        is_first = is_first.unsqueeze(-1)
+        hidden = torch.zeros(self.config.sample_batch_size, self.config.hidden_state_size).to(self.config.device) 
+        latent_enc = torch.zeros(self.config.sample_batch_size, self.config.num_categoricals, self.config.num_codes).to(self.config.device)
+        actions = torch.cat([torch.zeros_like(actions[:1]), actions[:-1]], dim=0)
         for i in range(T):
-            probs_enc, probs_dyn, reward_prob, continue_pred, state, hidden = self.dynamic_step(
-                obs_embeddings[i], actions[i], hidden, dones[i], i == 0)
+            probs_enc, probs_dyn, state, hidden, latent_enc = self.dynamic_step(
+                obs_embeddings[i], actions[i], hidden, latent_enc, is_first[i]
+            )
             enc_probs.append(probs_enc)
             dyn_probs.append(probs_dyn)
-            states.append(state.detach())
-            reward_probs.append(reward_prob)
-            continue_preds.append(continue_pred)
+            states.append(state)
             
         states = torch.stack(states)
         enc_probs = torch.stack(enc_probs)
         dyn_probs = torch.stack(dyn_probs)
-        continue_preds = torch.stack(continue_preds)
-        reward_probs = torch.stack(reward_probs)
+        continue_preds = self.continue_predictor(states)
+        reward_probs = self.reward_predictor(states)
         reconstructions = self.decoder.from_state(states.reshape(T * B, -1)).reshape(obs.shape)
         pred_loss, loss_dict = self.prediction_loss(obs, reconstructions, rewards, reward_probs, dones, continue_preds)
         dyn_loss = self.dynamics_loss(enc_probs, dyn_probs)
         rep_loss = self.representation_loss(enc_probs, dyn_probs)
         loss = pred_loss * self.config.prediction_loss_coef + dyn_loss * self.config.dynamics_loss_coef + rep_loss * self.config.representation_loss_coef
         loss_dict["KL divergence"] = to_numpy(dyn_loss)
-        return loss, loss_dict, states
+        return loss, loss_dict, states.detach()
     
     def prediction_loss(self, obs, reconstruction, reward, reward_probs, dones, continue_logits):
         reconstruction_error = symlog_squared_error(obs.flatten(2), reconstruction.flatten(2))
@@ -316,7 +325,9 @@ class DreamerV3:
         action = self.actor.policy_fn(state, det)
         return action, latent
     
-    def eval_action(self, obs, det=False):
+    def eval_action(self, obs, det=True, reset=False):
+        if reset:
+            self.eval_hidden = self.world_model._get_hidden(1)
         latent_prob = self.world_model.encoder(obs, self.eval_hidden)
         latent = Independent(OneHotCategoricalStraightThrough(latent_prob), 1).sample()
         state = make_state(latent, self.eval_hidden)
@@ -324,9 +335,12 @@ class DreamerV3:
         self.eval_hidden = self.world_model.recurrent_step(self.eval_hidden, latent, action).detach()
         return to_numpy(action)
     
-    def process_sample(self, obs, latent, action, reward, done):
+    def process_sample(self, obs, latent, action, reward, done, final_obs=None):
         # do a step in RSSM and store stuff in buffer
         self.buffer.add_sample([obs, to_numpy(action), reward, done])
+        done_idxs = torch.where(done)
+        
+        self.buffer.add_sample(..., done_idxs)
         continue_ = torch.tensor(1 - done).unsqueeze(1).to(self.device)
         self.active_hidden = (continue_ * self.world_model.recurrent_step(self.active_hidden, latent, action) + (1 - continue_) * self.world_model._get_hidden(self.config.num_envs)).detach()
     
@@ -357,14 +371,12 @@ class DreamerV3:
     
     def train(self):
         obs, actions, rewards, dones = self.buffer.sample_as_tensors(self.config.device, self.config.sample_batch_size, self.config.sample_seq_len)
-        hidden_start = torch.zeros(self.config.sample_batch_size, self.config.hidden_state_size).to(self.device) #states[0, :, self.config.latent_size:]
         if self.config.action_type == "discrete":
             actions = F.one_hot(actions.long(), self.config.action_dim).float()
-        loss_wm, loss_dict, new_states = self.world_model.world_model_loss(obs, actions, rewards, dones, hidden_start)
+        loss_wm, loss_dict, new_states = self.world_model.world_model_loss(obs, actions, rewards, dones)
         loss_wm.backward()
         torch.nn.utils.clip_grad_norm_(self.world_model.parameters(), 1000)
         self.optim_wm.step()
-        self.optim_wm.zero_grad()
         # loss_critic1, _, _ = self.train_critic(new_states, rewards, dones)
         
         states, rewards, imagined_dones, log_probs, entropy = self.imagine_rollout(new_states.reshape(-1, self.config.state_size))
@@ -380,17 +392,15 @@ class DreamerV3:
         torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 100)
         torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 100)
         self.optim_actor.step()
-        self.optim_actor.zero_grad()
         self.optim_critic.step()
+        
+        self.optim_wm.zero_grad()
+        self.optim_actor.zero_grad()
         self.optim_critic.zero_grad()
         loss_dict["actor loss"] = to_numpy(loss_actor)
         loss_dict["critic loss"] = to_numpy(loss_critic)
         loss_dict["actor entropy"] = to_numpy(actor_ent)
         return to_numpy(loss_wm), to_numpy(loss_critic), to_numpy(loss_actor), loss_dict 
-        
-    def train_world_model(self, obs, actions, rewards, dones, hidden):
-        loss, loss_dict = self.world_model.world_model_loss(obs, actions, rewards, dones, hidden)
-        return loss, loss_dict
     
     def train_actor(self, returns, values, action_log_probs, entropy, weights):
         range_ = torch.quantile(returns, 1 - self.percentiles) - torch.quantile(returns, self.percentiles)
@@ -443,7 +453,7 @@ class DreamerV3:
         init_last_layer(self.world_model.continue_predictor, 1)
         init_last_layer(self.world_model.dynamics_predictor, 1)
         init_last_layer(self.world_model.encoder, 1)
-        init_last_layer(self.world_model.decoder, 1)
+        # init_last_layer(self.world_model.decoder, 1)
         # init_last_layer(self.world_model.rssm, 1)
 
 
@@ -471,12 +481,12 @@ if __name__ == "__main__":
     encoder_parser.add_argument("--num_channels", default=3, type=int)
     encoder_parser.add_argument("--image_size", default=64, type=int) # images should be square
     encoder_parser.add_argument("--kernel_size", default=4, type=int) # best to keep it 4 or 6
-    encoder_parser.add_argument("--filter_base", default=64, type=int) # the base number of filters, which is doubled for each convolutional layer
+    encoder_parser.add_argument("--filter_base", default=96, type=int) # the base number of filters, which is doubled for each convolutional layer
     encoder_parser.add_argument("--num_convs", default=4, type=int) # total number of convolutions, after which the dimension is size / 2^num_convs, and the final number of filters is filter_base * 2^(num_convs-1)
     vector_parser.add_argument("--obs_dim", default=None, type=int) # specify both this and image stuff for multi
     world_model_parser.add_argument("--hidden_dim", default=1024, type=int) # hidden dims of MLPs
     world_model_parser.add_argument("--hidden_state_size", default=8192, type=int) # hidden state of GRU/RSSM
-    world_model_parser.add_argument("--num_hiddens_world_model", default=1, type=int) # determines the depth for MLPs in the world model
+    world_model_parser.add_argument("--num_hiddens_world_model", default=0, type=int) # determines the depth for MLPs in the world model
     world_model_parser.add_argument("--num_hiddens_actor_critic", default=2, type=int)
     world_model_parser.add_argument("--action_dim", default=4, type=int)
     world_model_parser.add_argument("--action_type", default="discrete", choices=["discrete", "continuous"])
@@ -507,7 +517,7 @@ if __name__ == "__main__":
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--lr", default=8e-5, type=float)
     parser.add_argument("--num_envs", default=32, type=int)
-    parser.add_argument("--replay_ratio", default=32, type=int) # batch_size * seq_len / timesteps_in_env = replay ratio, so default of 64 * 16 / num_envs * timesteps = 16
+    parser.add_argument("--replay_ratio", default=64, type=int) # batch_size * seq_len / timesteps_in_env = replay ratio, so default of 64 * 16 / num_envs * timesteps = 16
     config = parser.parse_args()
     if config.act == "silu":
         config.act = nn.SiLU
@@ -521,7 +531,13 @@ if __name__ == "__main__":
         config.output_dim = (config.filter_base * 2 ** (config.num_convs - 1), size, size)
     config.latent_size = config.num_categoricals * config.num_codes
     config.state_size = config.hidden_state_size + config.latent_size
-    config.train_every = config.sample_batch_size * config.sample_seq_len // (config.num_envs * config.replay_ratio)
+    config.train_every = config.sample_batch_size * config.sample_seq_len / (config.num_envs * config.replay_ratio)
+    if config.train_every > 1:
+        config.train_every = int(config.train_every)
+        num_iters = 1
+    else:
+        num_iters = int(1 / config.train_every)
+        config.train_every = 1
 
     def make_env(gym_id, eval=False):
         def thunk():
@@ -549,9 +565,11 @@ if __name__ == "__main__":
         obs = eval_env.reset()
         total_reward = 0
         num_completed = 0
+        is_first = True
         frames = []
         while not done:
-            action = dreamer.eval_action(torch.tensor(obs).float().to(config.device))
+            action = dreamer.eval_action(torch.tensor(obs).float().to(config.device), reset=is_first)
+            is_first = False
             obs, reward, done, infos = eval_env.step(action)
             total_reward += reward
             frames.append(eval_env.render())
@@ -574,7 +592,7 @@ if __name__ == "__main__":
             print(i)
         action, latent = dreamer.choose_action(torch.tensor(obs).float().to(config.device))
         next_obs, reward, done, info = env.step(action)
-        dreamer.process_sample(obs, latent, action, reward, done)
+        dreamer.process_sample(obs, latent, action, reward, done, info)
         if True in done:
             indices = np.where(done)[0]
             temp_rew = []
@@ -586,8 +604,9 @@ if __name__ == "__main__":
             eval_reward, frames = eval(dreamer, eval_env)
             logger.add_scalar("Eval Reward", eval_reward)
             imageio.mimwrite(f'gifs/Breakout_{i}.gif', frames[::4], loop=0, fps=20)
-        if i % config.train_every == 0 and i > 1000:
-            loss_wm, loss_critic, loss_actor, loss_dict = dreamer.train()
+        if i > 100 and i % config.train_every == 0:
+            for _ in range(num_iters):
+                loss_wm, loss_critic, loss_actor, loss_dict = dreamer.train()
             logger.add_scalar("World Model Loss", loss_wm)
             logger.add_metrics(loss_dict)
             logger.write(timestep)

@@ -151,7 +151,7 @@ class DreamerDecoderConv(nn.Module):
         filters = [filter_base * 2 ** i for i in reversed(range(num_convs))]
         layers = []
         for i, filter in enumerate(filters):
-            layers.append(nn.ConvTranspose2d(filter, image_channels if i == len(filters) - 1 else filters[i + 1], kernel_size, 2, padding=compute_pad(kernel_size, 2), bias=False))
+            layers.append(nn.ConvTranspose2d(filter, image_channels if i == len(filters) - 1 else filters[i + 1], kernel_size, 2, padding=compute_pad(kernel_size, 2), bias=i == len(filters) - 1))
             if i < len(filters) - 1:
                 layers.append(NormAndAct(image_channels if i == len(filters) - 1 else filters[i + 1], norm, act))
         self.layers = nn.Sequential(*layers)

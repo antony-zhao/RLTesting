@@ -15,6 +15,12 @@ class Logger:
         
     def add_metrics(self, metrics):
         self.scalars.update(metrics)
+    
+    def add_image(self, image):
+        self.writer.add_image()
+    
+    def add_video(self, video):
+        pass
         
     def write(self, timestep):
         for key, value in self.scalars.items():

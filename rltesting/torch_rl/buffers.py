@@ -79,8 +79,10 @@ class PerEnvBuffer:
         self.num_envs = num_envs
         self.num_items = len(buffer_shapes)
     
-    def add_sample(self, sample):
-        for i in range(self.num_envs):
+    def add_sample(self, sample, idxs=None):
+        if idxs is not None:
+            idxs = list(range(self.num_envs))
+        for i in idxs:
             self.buffers[i].add_sample([s[i] for s in sample])
     
     def add_sample_until_episode_terminal(self, sample):

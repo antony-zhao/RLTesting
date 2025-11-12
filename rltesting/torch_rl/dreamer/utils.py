@@ -14,7 +14,7 @@ def symexp(x):
     return torch.sign(x) * (torch.exp(torch.abs(x)) - 1)
 
 def symlog_squared_error(y, y_hat):
-    return (0.5 * (y - y_hat) ** 2).sum(-1).mean()
+    return ((y - y_hat) ** 2).sum(-1).mean()
 
 def init_last_layer(model, scale):
     # init func should be a partial func with everything already specified, might be a better way to do it but this is just what I know
