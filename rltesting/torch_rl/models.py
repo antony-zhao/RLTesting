@@ -14,7 +14,7 @@ def compute_pad(kernel_size, stride):
 
 class MLP(nn.Module):
     # if hidden dims is specified then doesn't use skip connections
-    def __init__(self, input_dim, output_dim, hidden_dim=256, num_hiddens=2, act=nn.SiLU, hidden_dims=None, final_act=None, use_bias_hidden=True, use_bias_final=True, skip_connections=None):
+    def __init__(self, input_dim, output_dim, hidden_dim=256, num_hiddens=2, act=nn.SiLU, hidden_dims=None, final_act=None, skip_connections=None):
         super().__init__()
         if hidden_dims is not None:
             assert len(hidden_dims) + 1 == num_hiddens
@@ -24,16 +24,16 @@ class MLP(nn.Module):
             self.skip_connections = True
         if skip_connections is not None:
             self.skip_connections = skip_connections
-        self.input_layer = nn.Linear(input_dim, hidden_dim, bias=use_bias_hidden)
+        self.input_layer = nn.Linear(input_dim, hidden_dim)
         self.hiddens = []
         for i in range(num_hiddens):
             if hidden_dims is None:
-                self.hiddens.append(nn.Linear(hidden_dim, hidden_dim, bias=use_bias_hidden))
+                self.hiddens.append(nn.Linear(hidden_dim, hidden_dim))
             else:
-                self.hiddens.append(nn.Linear(hidden_dim, hidden_dims[i + 1], bias=use_bias_hidden))
+                self.hiddens.append(nn.Linear(hidden_dim, hidden_dims[i + 1]))
                 hidden_dim = hidden_dims[i + 1]
         self.hiddens = nn.ModuleList(self.hiddens)
-        self.output_layer = nn.Linear(hidden_dim, output_dim, bias=use_bias_final)
+        self.output_layer = nn.Linear(hidden_dim, output_dim)
         self.act = act()
         self.final_act = final_act
     
@@ -69,7 +69,7 @@ class ResBlock(nn.Module):
             x_skip = self.skip(x_skip)
         return x + x_skip
 
-class AtariConv(nn.Module):
+class NatureCNN(nn.Module):
     # from the original Nature DQN paper
     # assumes the 84x84 grayscale and 4 frame stack
     def __init__(self, act=nn.SiLU, flatten_out=False, input_channels=4):
@@ -100,7 +100,7 @@ class AtariConv(nn.Module):
 class IMPALABlock(nn.Module):
     pass
 
-class IMPALACnn(nn.Module):
+class IMPALACNN(nn.Module):
     pass
 
 class ChannelNorm(nn.Module):
@@ -124,8 +124,21 @@ class NormAndAct(nn.Module):
         return self.act(x)
 
 class DreamerMLP(nn.Module):
-    def __init__(self, input_dim, output_dim, hidden_size, num_hiddens, act=nn.SiLU):
-        pass
+    def __init__(self, input_dim, output_dim, hidden_dim, num_hiddens, act=nn.SiLU):
+        super().__init__()
+        layers = []
+        layers.append(nn.Linear(input_dim, hidden_dim, bias=False))
+        layers.append(nn.LayerNorm(hidden_dim, eps=1e-5, elementwise_affine=True))
+        layers.append(act())
+        for _ in range(num_hiddens):
+            layers.append(nn.Linear(hidden_dim, hidden_dim, bias=False))
+            layers.append(nn.LayerNorm(hidden_dim, eps=1e-5, elementwise_affine=True))
+            layers.append(act())
+        layers.append(nn.Linear(hidden_dim, output_dim))
+        self.layers = nn.Sequential(*layers)
+        
+    def forward(self, x):
+        return self.layers(x)
 
 class DreamerEncoderConv(nn.Module):
     # built for 64x64 observations and downscales them to 4x4, can do other sizes but would need to be changed a bit
@@ -134,7 +147,8 @@ class DreamerEncoderConv(nn.Module):
         filters = [filter_base * 2 ** i for i in range(num_convs)]
         layers = []
         for i, filter in enumerate(filters):
-            layers.append(nn.Conv2d(image_channels if i == 0 else filters[i - 1], filter, kernel_size, 2, padding=compute_pad(kernel_size, 2), bias=False))
+            layers.append(nn.Conv2d(image_channels if i == 0 else filters[i - 1], filter, kernel_size, 
+                                    stride=2, padding=compute_pad(kernel_size, 2), bias=i == len(filters) - 1))
             if i < len(filters) - 1:
                 layers.append(NormAndAct(filter, norm, act))
         self.layers = nn.Sequential(*layers)
@@ -151,7 +165,8 @@ class DreamerDecoderConv(nn.Module):
         filters = [filter_base * 2 ** i for i in reversed(range(num_convs))]
         layers = []
         for i, filter in enumerate(filters):
-            layers.append(nn.ConvTranspose2d(filter, image_channels if i == len(filters) - 1 else filters[i + 1], kernel_size, 2, padding=compute_pad(kernel_size, 2), bias=i == len(filters) - 1))
+            layers.append(nn.ConvTranspose2d(filter, image_channels if i == len(filters) - 1 else filters[i + 1], kernel_size, 
+                                             stride=2, padding=compute_pad(kernel_size, 2), bias=i == len(filters) - 1))
             if i < len(filters) - 1:
                 layers.append(NormAndAct(image_channels if i == len(filters) - 1 else filters[i + 1], norm, act))
         self.layers = nn.Sequential(*layers)
@@ -195,6 +210,7 @@ class TargetNetwork(nn.Module):
     def __init__(self, original_network, tau=None, update_freq=None):
         super().__init__()
         self.network = copy.deepcopy(original_network)
+        self.original = original_network
         for param in self.network.parameters():
             param.requires_grad = False
         if tau is None and update_freq is None:
@@ -213,7 +229,7 @@ class TargetNetwork(nn.Module):
         else:
             self.i += 1
             if (self.i % self.update_freq) == 0:
-                self.network = copy.deepcopy(original)
+                self.network.load_state_dict(original_net_state_dict)
     
     def forward(self, x):
         # since this target should never be updated by gradients

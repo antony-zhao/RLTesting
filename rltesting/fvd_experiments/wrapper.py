@@ -26,5 +26,21 @@ class BasicEnvironmentRGB(Wrapper):
         return self.env.close()
     
     def reshape_obs(self, obs):
-        return cv2.resize(obs, dsize=self.obs_shape)
+        return cv2.resize(obs, dsize=self.obs_shape, interpolation=cv2.INTER_AREA)
+
+class DomainRandomization(Wrapper):
+    def __init__(self, env, args):
+        super().__init__(env)
+        self.env = env
+        # self.env.unwrapped.SCREEN_DIM = 800
+        self.args = args
+    
+    def domain_randomization(self):
+        unwrapped = self.env.unwrapped
+        for k, v in self.args.items():
+            setattr(unwrapped, k, float(np.random.uniform(*v)))
+    
+    def reset(self, **kwargs):
+        self.domain_randomization()
+        return self.env.reset(**kwargs)
     

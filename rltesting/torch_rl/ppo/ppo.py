@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from torch.distributions import Categorical, TanhTransform
 import numpy as np
 
-from rltesting.torch_rl.models import MLP, AtariConv, layer_init
+from rltesting.torch_rl.models import MLP, NatureCNN, layer_init
 from rltesting.utils.torch_utils import to_numpy, get_action_dim, get_obs_shape
 
 class Rollout:
@@ -44,7 +44,7 @@ class Rollout:
 class AtariPolicyNetwork(nn.Module):
     def __init__(self, num_actions):
         super(AtariPolicyNetwork, self).__init__()
-        self.conv = AtariConv()
+        self.conv = NatureCNN()
         self.mlp = MLP(self.conv.output_dim, num_actions)
     
     def forward(self, x):
@@ -71,7 +71,7 @@ class AtariPolicyNetwork(nn.Module):
 class AtariValueNetwork(nn.Module):
     def __init__(self, num_actions):
         super(AtariValueNetwork, self).__init__()
-        self.conv = AtariConv()
+        self.conv = NatureCNN()
         self.mlp = MLP(self.conv.output_dim, num_actions)
     
     def forward(self, x):
