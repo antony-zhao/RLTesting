@@ -72,7 +72,7 @@ class Decoder(nn.Module):
         return x
 
 class DoubleAutoencoder(nn.Module):
-    def __init__(self, encoder, decoder, latent_dim, intrinsic_dim, hidden_dim=2):
+    def __init__(self, encoder, decoder, latent_dim, intrinsic_dim, hidden_dim=256):
         super().__init__()
         self.encoder = encoder
         self.decoder = decoder
@@ -89,11 +89,18 @@ class DoubleAutoencoder(nn.Module):
         reconstructed = self.decoder(reconstructed_latent)
         return reconstructed
     
-    def compute_intrinsic(self, latent):
-        pass
-    
     def compute_latent(self, image):
         return self.encoder(image).detach()
+    
+    def compute_intrinsic(self, latent):
+        return self.intrinsic_encoder(latent)
+    
+    def reconstruct_latent(self, intrinsic):
+        return self.intrinsic_decoder(intrinsic)
+    
+    def reconstruct_image(self, latent):
+        return self.decoder(latent)
+
 
 # class LevinaBickelAlgorithm:
 #     def __init__(self, samples):

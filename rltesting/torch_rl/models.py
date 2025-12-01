@@ -206,7 +206,6 @@ class DreamerGRU(nn.Module):
         return h_new
 
 class TargetNetwork(nn.Module):
-    # TODO need to verify if this will keep a pointer to the original network or just a copy, I'm assuming pointer
     def __init__(self, original_network, tau=None, update_freq=None):
         super().__init__()
         self.network = copy.deepcopy(original_network)
@@ -219,9 +218,9 @@ class TargetNetwork(nn.Module):
         self.update_freq = update_freq
         self.i = 0
         
-    def update(self, original):
+    def update(self):
         target_net_state_dict = self.network.state_dict()
-        original_net_state_dict = original.state_dict()
+        original_net_state_dict = self.original.state_dict()
         if self.tau is not None:
             for key in original_net_state_dict:
                 target_net_state_dict[key] = original_net_state_dict[key] * self.tau + target_net_state_dict[key] * (1 - self.tau)
