@@ -48,7 +48,7 @@ class DecoderConv(nn.Module):
 class Encoder(nn.Module):
     def __init__(self, framestack, latent_dim, image_dim):
         super().__init__()
-        self.conv = EncoderConv(filter_base=16, image_channels=3 * framestack, input_size=image_dim) # 256, 4x4
+        self.conv = EncoderConv(filter_base=8, image_channels=3 * framestack, input_size=image_dim) # 256, 4x4
         self.conv_dim = self.conv.output_size
         self.out = nn.Linear(np.prod(self.conv.output_size), latent_dim) #MLP(np.prod(self.conv.output_size), latent_dim, 1024, skip_connections=False)
     
@@ -63,7 +63,7 @@ class Decoder(nn.Module):
         super().__init__()
         self._in = nn.Linear(latent_dim, np.prod(conv_dim))
         self.conv_dim = conv_dim
-        self.conv = DecoderConv(filter_base=16, image_channels=3 * framestack)
+        self.conv = DecoderConv(filter_base=8, image_channels=3 * framestack)
     
     def forward(self, x):
         x = self._in(x)
