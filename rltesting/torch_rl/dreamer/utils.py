@@ -14,7 +14,14 @@ def symexp(x):
     return torch.sign(x) * (torch.exp(torch.abs(x)) - 1)
 
 def symlog_squared_error(y, y_hat):
-    return ((y - y_hat) ** 2).sum(-1).mean()
+    return ((symlog(y) - symlog(y_hat)) ** 2).sum(-1).mean()
+
+def transform_obs(obs, is_image):
+    if is_image:
+        transformed_obs = obs / 255.0 - 0.5
+    else:
+        transformed_obs = symlog(obs)
+    return transformed_obs
 
 def init_last_layer(model, scale):
     # init func should be a partial func with everything already specified, might be a better way to do it but this is just what I know
@@ -70,28 +77,22 @@ def init_weights(m):
             m.bias.data.fill_(0.0)
 
 def compute_lambda_returns(values, rewards, continues, gamma, lambda_):
-    returns = torch.empty_like(values)
-    for i in reversed(range(len(values))):
-        if i < len(values) - 1:
-            returns[i] = rewards[i] + gamma * continues[i] * ((1 - lambda_) * values[i] + lambda_ * returns[i + 1])
-        else:
-            returns[i] = values[-1]
+    T = rewards.shape[0]
+    returns = torch.empty_like(rewards)
+
+    next_return = values[-1]
+    for t in reversed(range(T)):
+        next_return = rewards[t] + gamma * continues[t] * (
+            (1 - lambda_) * values[t + 1] + lambda_ * next_return
+        )
+        returns[t] = next_return
+
     return returns
 
-def compute_lambda_values(
-    values, rewards, continues, gamma, lmbda: float = 0.95,
-):
-    continues *= gamma
-    vals = [values[-1:]]
-    interm = rewards + continues * values * (1 - lmbda)
-    for t in reversed(range(len(continues))):
-        vals.append(interm[t] + continues[t] * lmbda * vals[-1])
-    ret = torch.cat(list(reversed(vals))[:-1])
-    return ret
-
 class WeightedAverageOverBins:
-    def __init__(self, bins, probs=None, logits=None, forward=symexp, backward=symlog):
-        self.probs = torch.softmax(logits, -1) if probs is None else probs
+    def __init__(self, bins, logits=None, forward=symexp, backward=symlog):
+        self.logits = logits
+        self.probs = torch.softmax(self.logits, -1)
         self.bins = bins
         self.forward = forward
         self.backward = backward
@@ -101,7 +102,8 @@ class WeightedAverageOverBins:
         return self.forward(weighted_average)
     
     def two_hot(self, vals):
-        index_1 = (self.bins.expand(vals.shape + (-1,)) < vals.unsqueeze(-1)).sum(-1) - 1
+        index_1 = torch.bucketize(vals, self.bins) - 1
+        index_1 = index_1.clamp(0, len(self.bins) - 2)
         index_2 = index_1 + 1
         b_k = self.bins[index_1]
         b_k2 = self.bins[index_2]
@@ -114,9 +116,8 @@ class WeightedAverageOverBins:
     
     def log_prob(self, vals, aggregate=True):
         # basically just the loss
-        target = self.two_hot(self.backward(vals))
-        log_probs = (target * torch.log(self.probs)).sum(-1)
-        if aggregate:
-            return log_probs.mean()
-        return log_probs
+        target = self.two_hot(self.backward(vals)).detach()
+        log_probs = self.logits - torch.logsumexp(self.logits, dim=-1, keepdim=True) 
+        loss = (target * log_probs).sum(-1)
+        return loss.mean() if aggregate else loss
     

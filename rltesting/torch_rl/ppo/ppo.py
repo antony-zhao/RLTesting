@@ -29,6 +29,7 @@ class Rollout:
         self.rewards = np.zeros((self.rollout_length, self.num_envs), dtype=np.float32)
         self.dones = np.zeros((self.rollout_length, self.num_envs), dtype=np.float32)
         self.log_probs = np.zeros((self.rollout_length, self.num_envs), dtype=np.float32)
+        self.ind = 0
     
     def add(self, obs, action, reward, done, log_prob):
         self.obs[self.ind] = obs
