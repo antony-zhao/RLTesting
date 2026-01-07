@@ -5,7 +5,8 @@ from matplotlib import pyplot as plt
 from rltesting.torch_rl.utils import random_sample_single_env
 from rltesting.torch_rl.buffers import ReplayBuffer
 from rltesting.torch_rl.models import MLP, TargetNetwork
-from fundamental_variable_discovery import Encoder, Decoder, DoubleAutoencoder
+from rltesting.utils.logger import Logger
+from fundamental_variable_discovery import Encoder, Decoder, DoubleAutoEncoder
 import torch.nn.functional as F
 import numpy as np
 import torch
@@ -19,7 +20,7 @@ to_numpy = lambda x: x.cpu().detach().numpy()
 framestack = 2
 latent_dim = 2048
 obs_shape = 64
-data_steps = 100000
+data_steps = 50000
 train_steps = 8000
 l1_coeff = 0
 env = gym.make('ALE/Pong-v5', render_mode="rgb_array")
@@ -68,8 +69,8 @@ for _ in range(20):
 print(f"Latent ID: {np.mean(latent_ID)} +- {np.std(latent_ID)}")
 print(f"Image ID: {np.mean(image_ID)} +- {np.std(image_ID)}")
 
-intrinsic_dim = round(1.5 * np.mean(latent_ID))
-double_autoencoder = DoubleAutoencoder(encoder, decoder, latent_dim, intrinsic_dim).cuda()
+intrinsic_dim = round(2 * np.mean(latent_ID))
+double_autoencoder = DoubleAutoEncoder(encoder, decoder, latent_dim, intrinsic_dim).cuda()
 int_opt = torch.optim.AdamW(double_autoencoder.parameters(), 3e-4)
 
 losses = []
@@ -88,6 +89,8 @@ for i in range(train_steps):
     opt.zero_grad()
     losses.append(loss.detach().cpu().numpy())
 
+del buffer
+
 num_actions = 6
 q_network = MLP(intrinsic_dim, num_actions, skip_connections=False).cuda()
 q_opt = torch.optim.Adam(q_network.parameters(), 3e-4)
@@ -95,10 +98,11 @@ dtypes = [np.uint8, np.float32, np.float32, np.uint8, np.float32]
 buffer_shapes = [(obs_shape, obs_shape, 3 * framestack), (), (), (obs_shape, obs_shape, 3 * framestack), ()]
 dqn_buffer = ReplayBuffer(buffer_shapes, dtypes, buffer_size=1_000_000)
 q_target = TargetNetwork(q_network, tau=1e-4).cuda()
+ae_target = TargetNetwork(double_autoencoder, tau=3e-5).cuda()
 eps = 1
 eps_decay = 0.99
 eps_min = 0.1
-num_episodes = 1000
+num_episodes = 10000
 train_after = 10000
 gamma = 0.99
 
@@ -112,19 +116,19 @@ def dqn_loss(q_network, q_target, obs, action, reward, next_obs, done, q_opt):
     q_opt.step()
     return q_loss
 
-def model_losses(q_network, q_target, double_autoencoder, buffer, q_opt, double_ae_opt, batch_size=512):
+def model_losses(q_network, q_target, double_autoencoder, ae_target, buffer, q_opt, double_ae_opt, batch_size=256):
+    ae_target.update()
     obs, action, reward, next_obs, done = buffer.sample(batch_size)
     obs = (torch.as_tensor(obs).float().transpose(-3, -1) / 255).cuda()
     action = torch.as_tensor(action).long().cuda()
     reward = torch.as_tensor(reward).float().cuda()
     next_obs = (torch.as_tensor(next_obs).float().transpose(-3, -1) / 255).cuda()
     done = torch.as_tensor(done).float().cuda()
-    intrinsic = double_autoencoder.double_encode(obs)
-    next_intrinsic = double_autoencoder.double_encode(next_obs).detach()
+    intrinsic = ae_target.net.double_encode(obs)
+    next_intrinsic = ae_target.net.double_encode(next_obs).detach()
     q_loss = dqn_loss(q_network, q_target, intrinsic.detach(), action, reward, next_intrinsic, done, q_opt)
     
-    reconstruction = double_autoencoder.double_decode(intrinsic)
-    reconstruction_loss = F.mse_loss(reconstruction, obs)
+    reconstruction_loss = double_autoencoder.reconstruction_loss(obs)
     double_ae_opt.zero_grad()
     reconstruction_loss.backward()
     double_ae_opt.step()
@@ -139,6 +143,7 @@ step = 0
 ep_rew = 0
 ep_rew_ema = None
 smoothing = 0.9
+logger = Logger('logs/pong_neural_variables')
 for episode in range(1, num_episodes + 1):
     if episode % 50 == 0:
         print(episode, ep_rew_ema)
@@ -156,7 +161,7 @@ for episode in range(1, num_episodes + 1):
             else:
                 intrinsic = double_autoencoder.double_encode(obs_tensor.unsqueeze(0))
                 action = to_numpy(q_network(intrinsic).argmax())
-            q_loss, ae_loss = model_losses(q_network, q_target, double_autoencoder, dqn_buffer, q_opt, int_opt)
+            q_loss, ae_loss = model_losses(q_network, q_target, double_autoencoder, ae_target, dqn_buffer, q_opt, int_opt)
             q_loss_.append(q_loss)
             ae_loss_.append(ae_loss)
         else:
@@ -166,6 +171,10 @@ for episode in range(1, num_episodes + 1):
         dqn_buffer.add_sample([obs, action, reward, next_obs, done])
         ep_rew += reward
         obs = next_obs
+    logger.add_scalar('ep_rew', ep_rew)
+    logger.add_scalar('q_loss', np.mean(q_loss_))
+    logger.add_scalar('autoencoder_loss', np.mean(ae_loss_))
+    logger.write(episode)
     ep_rews.append(ep_rew)
     q_losses.append(np.mean(q_loss_))
     ae_losses.append(np.mean(ae_loss_))

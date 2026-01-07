@@ -230,6 +230,9 @@ class TargetNetwork(nn.Module):
             if (self.i % self.update_freq) == 0:
                 self.network.load_state_dict(original_net_state_dict)
     
-    def forward(self, x):
-        # since this target should never be updated by gradients
-        return self.network(x)
+    def forward(self, *args, **kwargs):
+        return self.network(*args, **kwargs)
+
+    @property
+    def net(self):
+        return self.network
