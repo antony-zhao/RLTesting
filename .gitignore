@@ -175,3 +175,7 @@ cython_debug/
 *.png
 *.eqx
 *.svg
+/logs/*/
+CIFAR
+ImageNet100
+*.gif
