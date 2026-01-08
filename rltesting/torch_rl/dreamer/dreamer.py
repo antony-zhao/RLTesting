@@ -11,8 +11,6 @@ from functools import partial
 from torch.distributions import OneHotCategoricalStraightThrough, Independent, Categorical, Normal, kl_divergence, Bernoulli
 from torch.distributions.utils import probs_to_logits
 
-mlp_norm_act = lambda dim, act: partial(NormAndAct, norm_dim=dim, act=act)
-
 make_state = lambda latent, hidden: torch.cat([latent.flatten(-2), hidden], -1)
 
 class DreamerEncoder(nn.Module):
@@ -92,7 +90,7 @@ class RSSM(nn.Module):
     def forward(self, z, h, a):
         x1 = self.in_hidden(h)
         x2 = self.in_latent(z)
-        x3 = self.in_action(a) # need to verify that this is a copy of the action with no gradients
+        x3 = self.in_action(a)
         x = torch.cat([x1, x2, x3], -1)
         x = self.act1(x)
         x = self.mlp(x)
@@ -157,13 +155,6 @@ class DreamerWorldModel(nn.Module):
         return probs_enc, probs_dyn, state, next_hidden
     
     def _get_hidden(self, batch_size):
-        # if self.h_initial is None:
-        #     h_0 = torch.tanh(self.initial_hidden.expand(1, -1))
-        #     logits_dyn = self.dynamics_predictor(h_0)
-        #     logits_dyn = logits_dyn.reshape(-1, self.config.num_categoricals, self.config.num_codes)
-        #     z_0 = Independent(OneHotCategoricalStraightThrough(logits=logits_dyn), 1).mode
-        #     self.h_initial = self.rssm(z_0.flatten(-2), h_0, torch.zeros(1, self.config.action_dim).to(self.config.device))
-        # return self.h_initial.expand(batch_size, -1)
         return torch.tanh(self.initial_hidden.expand(batch_size, -1))
     
     def recurrent_step (self, hidden, latent, action):
@@ -221,15 +212,13 @@ class DreamerWorldModel(nn.Module):
         latent_enc = Independent(OneHotCategoricalStraightThrough(probs_enc.detach()), 1)
         latent_dyn = Independent(OneHotCategoricalStraightThrough(probs_dyn), 1)
         kl_div = kl_divergence(latent_enc, latent_dyn)
-        return torch.max(kl_div, torch.ones_like(kl_div) * self.config.free_nats).mean() 
-        #torch.clip(kl_divergence(latent_enc, latent_dyn), min=1).mean()
+        return torch.clip(kl_div, min=self.config.free_nats).mean() 
     
     def representation_loss(self, probs_enc, probs_dyn):
         latent_enc = Independent(OneHotCategoricalStraightThrough(probs_enc), 1)
         latent_dyn = Independent(OneHotCategoricalStraightThrough(probs_dyn.detach()), 1)
         kl_div = kl_divergence(latent_enc, latent_dyn)
-        return torch.max(kl_div, torch.ones_like(kl_div) * self.config.free_nats).mean() 
-        # return torch.clip(kl_divergence(latent_enc, latent_dyn), min=1).mean()
+        return torch.clip(kl_div, min=self.config.free_nats).mean() 
           
 class Actor(nn.Module):
     def __init__(self, config):
@@ -240,15 +229,13 @@ class Actor(nn.Module):
         if config.action_type == "continuous":
             self.log_std = nn.Parameter(-torch.ones(config.action_dim))
         else:
-            self.proportion = 0.01
-            self.proportion_decay = 0.995
-            self.proportion_min = 0.01
+            self.actor_unimix = config.actor_unimix
     
     def policy_dist(self, x):
         logits = self.mlp(x)
         if self.action_type == "discrete":
             probs = torch.softmax(logits, -1)
-            unimixed_probs = unimix(probs, self.action_dim, self.proportion)
+            unimixed_probs = unimix(probs, self.action_dim, self.actor_unimix)
             logits = probs_to_logits(unimixed_probs)
             action_dist = Categorical(logits=logits)
         else:
@@ -270,9 +257,6 @@ class Actor(nn.Module):
         else:
             return action_dist.mode
         return action.detach()
-
-    def decay_unimix_proportion(self):
-        self.proportion = max(self.proportion * self.proportion_decay, self.proportion_min)
     
 class Critic(nn.Module):
     def __init__(self, config, bins):
@@ -294,9 +278,9 @@ class DreamerV3:
         self.critic = Critic(config, self.world_model.bins).to(self.device)
         self.init_models()
         self.critic_target = TargetNetwork(self.critic, config.critic_tau)
-        self.optim_wm = Adam(self.world_model.parameters(), config.lr, eps=1e-5)
-        self.optim_actor = Adam(self.actor.parameters(), config.lr, eps=1e-5)
-        self.optim_critic = Adam(self.critic.parameters(), config.lr, eps=1e-5)
+        self.optim_wm = Adam(self.world_model.parameters(), config.wm_lr, eps=1e-5)
+        self.optim_actor = Adam(self.actor.parameters(), config.ac_lr, eps=1e-5)
+        self.optim_critic = Adam(self.critic.parameters(), config.ac_lr, eps=1e-5)
         
         act_dim = () if config.action_type == "discrete" else (config.action_dim,)
         if config.obs_type == "image":
@@ -380,36 +364,30 @@ class DreamerV3:
         loss_wm, loss_dict, new_states = self.world_model.world_model_loss(obs, actions, rewards, dones)
         self.optim_wm.zero_grad()
         loss_wm.backward()
-        torch.nn.utils.clip_grad_norm_(self.world_model.parameters(), 1000)
+        torch.nn.utils.clip_grad_norm_(self.world_model.parameters(), 5)
         self.optim_wm.step()
-        # loss_critic1, _, _ = self.train_critic(new_states, rewards[:-1], dones[:-1])
         
         states, rewards, continues, log_probs, entropy = self.imagine_rollout(new_states.reshape(-1, self.config.state_size))
         continues[0] = (1 - dones.flatten())
-        with torch.no_grad():
-            weights = (torch.cumprod(continues * self.config.gamma, dim=0)).detach() / self.config.gamma
             
-        loss_critic2, returns, values = self.train_critic(states, rewards, continues, weights)
-        loss_actor, actor_ent = self.train_actor(returns, values, log_probs, entropy, weights)
+        loss_critic, returns, values = self.train_critic(states, rewards, continues)
+        loss_actor, actor_ent = self.train_actor(returns, values, log_probs, entropy)
         
-        loss_critic = loss_critic2 #+ 0.3 * loss_critic1
         self.optim_critic.zero_grad()
         loss_critic.backward()
-        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 100)
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 5)
         self.optim_critic.step()
         self.optim_actor.zero_grad()
         loss_actor.backward()
-        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 100)
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 5)
         self.optim_actor.step()
         
         loss_dict["loss/actor loss"] = to_numpy(loss_actor)
         loss_dict["loss/critic loss"] = to_numpy(loss_critic)
         loss_dict["loss/actor entropy"] = to_numpy(actor_ent)
-        # self.world_model.h_initial = None
-        self.actor.decay_unimix_proportion()
         return to_numpy(loss_wm), to_numpy(loss_critic), to_numpy(loss_actor), loss_dict 
     
-    def train_actor(self, returns, values, action_log_probs, entropy, weights):
+    def train_actor(self, returns, values, action_log_probs, entropy):
         range_ = torch.quantile(returns, 1 - self.percentiles) - torch.quantile(returns, self.percentiles)
         if self.range_ema is not None:
             self.range_ema = range_ * self.return_range_tau + self.range_ema * (1 - self.return_range_tau)
@@ -418,10 +396,10 @@ class DreamerV3:
         
         adv = ((returns - values) / torch.clip(self.range_ema, min=1)).detach()
         actor_loss = -(adv * action_log_probs + entropy * self.config.entropy_coef)
-        actor_loss = (actor_loss).mean()
+        actor_loss = actor_loss.mean()
         return actor_loss, entropy.mean()
     
-    def train_critic(self, states, rewards, continues, weights):
+    def train_critic(self, states, rewards, continues):
         self.critic_target.update()
         values, value_logits = self.critic(states)
         value_target, _ = self.critic_target(states)
@@ -429,7 +407,7 @@ class DreamerV3:
         value_bins = WeightedAverageOverBins(self.world_model.bins, value_logits[:-1])
         loss = -value_bins.log_prob(returns.detach(), aggregate=False)
         loss -= value_bins.log_prob(value_target.detach()[:-1], aggregate=False)
-        loss = (loss).mean()
+        loss = loss.mean()
         return loss, returns.detach(), values.detach()[:-1] # returning returns and values for the actor to reuse later
         
     def checkpoint_models(self, folderpath, filename):
@@ -447,20 +425,11 @@ class DreamerV3:
         self.world_model.decoder.apply(init_weights)
         self.world_model.rssm.apply(init_weights)
         
-        # init_last_layer(self.critic, nn.init.zeros_)
-        # init_last_layer(self.world_model.reward_predictor, nn.init.zeros_)
-        # init_last_layer(self.actor, nn.init.xavier_uniform_)
-        # init_last_layer(self.world_model.continue_predictor, nn.init.xavier_uniform_)
-        # init_last_layer(self.world_model.dynamics_predictor, nn.init.xavier_uniform_)
-        # init_last_layer(self.world_model.encoder, nn.init.xavier_uniform_)
-        # init_last_layer(self.world_model.decoder, nn.init.xavier_uniform_)
-        # init_last_layer(self.world_model.rssm, nn.init.xavier_uniform_)
-        init_last_layer(self.critic, 0)
-        init_last_layer(self.world_model.reward_predictor, 0)
-        init_last_layer(self.actor, 1)
-        init_last_layer(self.world_model.continue_predictor, 1)
-        init_last_layer(self.world_model.dynamics_predictor, 1)
-        init_last_layer(self.world_model.encoder, 1)
-        # init_last_layer(self.world_model.decoder, 1)
-        # init_last_layer(self.world_model.rssm, 1)
-        
+        init_last_layer(self.critic, nn.init.zeros_)
+        init_last_layer(self.world_model.reward_predictor, nn.init.zeros_)
+        init_last_layer(self.actor, nn.init.xavier_uniform_)
+        init_last_layer(self.world_model.continue_predictor, nn.init.xavier_uniform_)
+        init_last_layer(self.world_model.dynamics_predictor, nn.init.xavier_uniform_)
+        init_last_layer(self.world_model.encoder, nn.init.xavier_uniform_)
+        init_last_layer(self.world_model.decoder, nn.init.xavier_uniform_)
+        init_last_layer(self.world_model.rssm, nn.init.xavier_uniform_)

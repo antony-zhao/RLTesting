@@ -23,19 +23,14 @@ def transform_obs(obs, is_image):
         transformed_obs = symlog(obs)
     return transformed_obs
 
-def init_last_layer(model, scale):
+def init_last_layer(model, init_func):
     # init func should be a partial func with everything already specified, might be a better way to do it but this is just what I know
     for module in model.modules():
-        if isinstance(module, (nn.Linear)):#, nn.Conv2d)):#, nn.ConvTranspose2d)):
+        if isinstance(module, (nn.Linear)):
             last_layer = module
-    # init_func(last_layer.weight)
+            
     if isinstance(last_layer, nn.Linear):
-        in_num = last_layer.in_features
-        out_num = last_layer.out_features
-        denoms = (in_num + out_num) / 2.0
-        scale = scale / denoms
-        limit = np.sqrt(3 * scale)
-        nn.init.uniform_(last_layer.weight.data, a=-limit, b=limit)
+        init_func(last_layer.weight.data)
         if hasattr(last_layer.bias, "data"):
             last_layer.bias.data.fill_(0.0)
     elif isinstance(last_layer, nn.LayerNorm):
@@ -43,38 +38,15 @@ def init_last_layer(model, scale):
         if hasattr(last_layer.bias, "data"):
             last_layer.bias.data.fill_(0.0)
     
-def init_weights(m):
-    # if isinstance(module, (nn.Linear, nn.Conv2d)):
-    #     nn.init.xavier_normal_(module.weight)
-    #     if hasattr(module.bias, "data"):
-    #         module.bias.data.fill_(0.0)
-    # elif isinstance(module, nn.LayerNorm):
-    #     module.weight.data.fill_(1.0)
-    #     if hasattr(module.bias, "data"):
-    #         module.bias.data.fill_(0.0)
-    if isinstance(m, nn.Linear):
-        in_num = m.in_features
-        out_num = m.out_features
-        denoms = (in_num + out_num) / 2.0
-        scale = 1.0 / denoms
-        std = np.sqrt(scale) / 0.87962566103423978
-        nn.init.trunc_normal_(m.weight.data, mean=0.0, std=std, a=-2.0 * std, b=2.0 * std)
-        if hasattr(m.bias, "data"):
-            m.bias.data.fill_(0.0)
-    elif isinstance(m, nn.Conv2d) or isinstance(m, nn.ConvTranspose2d):
-        space = m.kernel_size[0] * m.kernel_size[1]
-        in_num = space * m.in_channels
-        out_num = space * m.out_channels
-        denoms = (in_num + out_num) / 2.0
-        scale = 1.0 / denoms
-        std = np.sqrt(scale) / 0.87962566103423978
-        nn.init.trunc_normal_(m.weight.data, mean=0.0, std=std, a=-2.0, b=2.0)
-        if hasattr(m.bias, "data"):
-            m.bias.data.fill_(0.0)
-    elif isinstance(m, nn.LayerNorm):
-        m.weight.data.fill_(1.0)
-        if hasattr(m.bias, "data"):
-            m.bias.data.fill_(0.0)
+def init_weights(module):
+    if isinstance(module, (nn.Linear, nn.Conv2d)):
+        nn.init.xavier_normal_(module.weight)
+        if hasattr(module.bias, "data"):
+            module.bias.data.fill_(0.0)
+    elif isinstance(module, nn.LayerNorm):
+        module.weight.data.fill_(1.0)
+        if hasattr(module.bias, "data"):
+            module.bias.data.fill_(0.0)
 
 def compute_lambda_returns(values, rewards, continues, gamma, lambda_):
     T = rewards.shape[0]
