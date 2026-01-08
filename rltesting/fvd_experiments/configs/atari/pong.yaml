@@ -1,0 +1,5 @@
+env_id: "Pong-v5"
+framestack: 2
+latent_dim: 1024
+data_steps: 20000
+train_steps: 1000
