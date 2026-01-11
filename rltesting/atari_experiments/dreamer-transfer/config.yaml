@@ -1,0 +1,53 @@
+obs_type: image  # image, vector, or multi (image is the only one implemented for now)
+env_id: Assault
+device: auto  # auto (depends on if cuda is available) cuda or cpu
+
+image_encoder:
+  num_channels: 3
+  image_size: 64
+  kernel_size: 4
+  filter_base: 96
+  num_convs: 4
+
+vector:
+  obs_dim: null  # specify for vector or multi
+
+world_model:
+  hidden_dim: 1024
+  hidden_state_size: 8192
+  num_hiddens_world_model: 0
+  num_hiddens_actor_critic: 2
+  action_type: discrete  # discrete or continuous
+  num_categoricals: 32
+  num_codes: 32
+  latent_unimix: 0.01
+  use_block_linear: true
+  act: silu  # silu, gelu, or relu
+  prediction_loss_coef: 1.0
+  dynamics_loss_coef: 0.5
+  representation_loss_coef: 0.1
+  free_nats: 1.0
+  bin_low: -20
+  bin_high: 20
+  num_bins: 255
+
+training:
+  sample_batch_size: 16
+  sample_seq_len: 64
+  rollout_length: 16
+  replay_ratio: 32
+  num_envs: 32
+
+actor_critic:
+  critic_tau: 0.02
+  critic_imagination_loss_coef: 1.0
+  entropy_coef: 0.0003
+  actor_unimix: 0.01
+  return_range_tau: 0.01
+  gamma: 0.997
+  lambda_: 0.95
+  percentiles: 0.05
+
+optimizer:
+  wm_lr: 0.00008
+  ac_lr: 0.00004

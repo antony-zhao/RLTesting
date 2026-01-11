@@ -1,15 +1,11 @@
 import gymnasium as gym
 from rltesting.utils.logger import Logger
-from dreamer import *
-
+from rltesting.torch_rl.dreamer.dreamer import *
 import ale_py
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import SubprocVecEnv
 from stable_baselines3.common.atari_wrappers import NoopResetEnv, FireResetEnv
 import argparse
-import imageio
-import os
-
 
 def parse_args():
     parser = argparse.ArgumentParser(description="just a temporary argparse while I debug the world model, will be moved elsewhere later")
@@ -116,7 +112,7 @@ def eval(dreamer, eval_env, config):
                 num_completed += 1
     return total_reward, obs_traj, frames
 
-def imagine_rollout(dreamer, config):
+def imagine_rollout(dreamer, eval_env, config):
     obs = eval_env.reset()
     obs = torch.tensor(obs).float().to(config.device)
     eval_hidden = dreamer.world_model._get_hidden(1)
@@ -141,7 +137,7 @@ if __name__ == "__main__":
     losses_dict = {}
     obs = env.reset()
     timestep = 0
-    for i in range(5_000_000 // config.num_envs):
+    for i in range(1, 5_000_000 // config.num_envs + 1):
         timestep += config.num_envs
         if i % 100 == 0:
             print(i)
@@ -155,12 +151,12 @@ if __name__ == "__main__":
                 temp_rew.append(info[index]["episode"]["r"])
             logger.add_scalar("rewards/train reward", np.mean(temp_rew))
             logger.write(timestep)
-        if i % 1000 == 0:
+        if i % 1000 == 0 or i == 1:
             eval_reward, obs_traj, frames = eval(dreamer, eval_env, config)
             logger.add_scalar("rewards/eval reward", eval_reward)
             logger.add_video("videos/eval observed", np.concatenate(obs_traj)[np.newaxis, :].astype(np.uint8), fps=120)
             logger.add_video("videos/eval video", np.asarray(frames)[np.newaxis, :].transpose(0, 1, 4, 2, 3), fps=120)
-            imagined_rollout = imagine_rollout(dreamer, config)
+            imagined_rollout = imagine_rollout(dreamer, eval_env, config)
             logger.add_video("videos/imagined rollout", imagined_rollout, fps=120)
             logger.write(timestep)
         if i > 500 and i % config.train_every == 0:
@@ -169,3 +165,4 @@ if __name__ == "__main__":
             logger.add_metrics(loss_dict)
             logger.write(timestep)
         obs = next_obs
+    
