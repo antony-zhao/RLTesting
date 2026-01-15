@@ -46,3 +46,10 @@ def flatten(d):
     thunk(d)
     
     return flat
+
+def simple_process_config(config):
+    config = flatten(config)
+    config = SimpleNamespace(**config)
+    if hasattr(config, "device"):
+        config.device = ("cuda" if torch.cuda.is_available() else "cpu") if config.device == "auto" else config.device
+    return config

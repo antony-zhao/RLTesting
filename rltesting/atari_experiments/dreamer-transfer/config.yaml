@@ -49,5 +49,5 @@ actor_critic:
   percentiles: 0.05
 
 optimizer:
-  wm_lr: 0.00008
-  ac_lr: 0.00004
+  wm_lr: 8.0e-5
+  ac_lr: 4.0e-5

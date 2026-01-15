@@ -1,104 +1,35 @@
-from wrapper import BasicEnvironmentRGB, DomainRandomization
-import gymnasium as gym
-from gymnasium.wrappers import FrameStackObservation, TransformObservation, ResizeObservation
+from fvd_pretrain import load_or_create_model, pretrain, make_env, to_numpy
 from matplotlib import pyplot as plt
-from rltesting.torch_rl.utils import random_sample_single_env
+from rltesting.torch_rl.utils import load_config, simple_process_config
 from rltesting.torch_rl.buffers import ReplayBuffer
 from rltesting.torch_rl.models import MLP, TargetNetwork
 from rltesting.utils.logger import Logger
-from fundamental_variable_discovery import Encoder, Decoder, DoubleAutoEncoder
+from fvd_models import Encoder, Decoder, DoubleAutoEncoder
 import torch.nn.functional as F
 import numpy as np
 import torch
-import skdim
-import time
-import ale_py
 
-gym.register_envs(ale_py)
+config_path = "rltesting/fvd_experiments/configs/atari/default.yaml"
+config = load_config(config_path)
+config = simple_process_config(config)
 
-to_numpy = lambda x: x.cpu().detach().numpy()
-framestack = 2
-latent_dim = 2048
-obs_shape = 64
-data_steps = 50000
-train_steps = 8000
-l1_coeff = 0
-env = gym.make('ALE/Pong-v5', render_mode="rgb_array")
-env = ResizeObservation(env, (64, 64))
-env = FrameStackObservation(env, stack_size=framestack)
-env = TransformObservation(env, lambda obs: np.transpose(obs, (1, 2, 0, 3)), observation_space=gym.spaces.Box(0, 255, (framestack, 3, obs_shape, obs_shape), dtype=np.uint8))
-env = TransformObservation(env, lambda obs: np.reshape(obs, (obs_shape, obs_shape, 3 * framestack)), observation_space=gym.spaces.Box(0, 255, (obs_shape, obs_shape, 3 * framestack), dtype=np.uint8))
-buffer_shapes = [(obs_shape, obs_shape, 3 * framestack), (), (), ()]
-dtypes = [np.uint8, np.float32, np.float32, np.float32]
-buffer = ReplayBuffer(buffer_shapes, dtypes, buffer_size=data_steps)
+num_channels = 3 if not config.grayscale else 1
 
-samples = random_sample_single_env(env, num_steps=data_steps)
-for i in range(data_steps):
-    buffer.add_sample([samples[j][i] for j in range(len(samples))].copy())
+encoder = Encoder(config.framestack, config.latent_dim, config.image_size, num_channels).to(config.device)
+decoder = Decoder(encoder.conv_dim, config.framestack, config.latent_dim, num_channels).to(config.device)
+double_autoencoder = load_or_create_model(config, encoder, decoder)
     
-encoder = Encoder(framestack, latent_dim, obs_shape, filter_base=16).cuda()
-decoder = Decoder(encoder.conv_dim, framestack, latent_dim, filter_base=16).cuda()
-opt = torch.optim.Adam(list(encoder.parameters()) + list(decoder.parameters()), 3e-4)
-losses = []
-for i in range(train_steps):
-    if i % 1000 == 0:
-        print(i)
-    samples = buffer.sample(256)
-    obs = (torch.tensor(samples[0]).float().transpose(-3, -1) / 255).cuda()
-    latent = encoder(obs)
-    reconstruction = decoder(latent)
-    loss = torch.nn.functional.mse_loss(reconstruction, obs)
-    loss.backward()
-    opt.step()
-    opt.zero_grad()
-    losses.append(loss.detach().cpu().numpy())
+env = make_env(config.env_type, config.env_id, config.framestack, config.image_size, config.grayscale)
 
-latent_ID = []
-image_ID = []
-
-for _ in range(20):
-    samples = buffer.sample(2048)
-    obs = (torch.tensor(samples[0]).float().transpose(-3, -1) / 255).cuda()
-    latent = encoder(obs)
-    unique_latents = np.unique(latent.detach().cpu().numpy(), axis=0)
-    unique_obs = np.unique(obs.detach().cpu().numpy(), axis=0).reshape(-1, 3 * framestack*obs_shape*obs_shape)
-
-    latent_ID.append(skdim.id.MLE().fit(unique_latents).dimension_)
-    image_ID.append(skdim.id.MLE().fit(unique_obs).dimension_)
-
-print(f"Latent ID: {np.mean(latent_ID)} +- {np.std(latent_ID)}")
-print(f"Image ID: {np.mean(image_ID)} +- {np.std(image_ID)}")
-
-intrinsic_dim = round(2 * np.mean(latent_ID))
-double_autoencoder = DoubleAutoEncoder(encoder, decoder, latent_dim, intrinsic_dim).cuda()
-int_opt = torch.optim.AdamW(double_autoencoder.parameters(), 3e-4)
-
-losses = []
-for i in range(train_steps):
-    if i % 1000 == 0:
-        print(i)
-    samples = buffer.sample(256)
-    obs = (torch.tensor(samples[0]).float().transpose(-3, -1) / 255).cuda()
-    intrinsic = double_autoencoder.double_encode(obs)
-    reconstruction = double_autoencoder.double_decode(intrinsic)
-    loss = torch.nn.functional.mse_loss(reconstruction, obs)
-    loss.backward()
-    int_opt.step()
-    int_opt.zero_grad()
-    opt.step()
-    opt.zero_grad()
-    losses.append(loss.detach().cpu().numpy())
-
-del buffer
-
-num_actions = 6
-q_network = MLP(intrinsic_dim, num_actions, skip_connections=False).cuda()
+num_actions = env.action_space.n
+q_network = MLP(double_autoencoder.intrinsic_dim, num_actions, skip_connections=False).to(config.device)
+int_opt = torch.optim.Adam(double_autoencoder.parameters(), 3e-4)
 q_opt = torch.optim.Adam(q_network.parameters(), 3e-4)
 dtypes = [np.uint8, np.float32, np.float32, np.uint8, np.float32]
-buffer_shapes = [(obs_shape, obs_shape, 3 * framestack), (), (), (obs_shape, obs_shape, 3 * framestack), ()]
+buffer_shapes = [(config.image_size, config.image_size, num_channels * config.framestack), (), (), (config.image_size, config.image_size, num_channels * config.framestack), ()]
 dqn_buffer = ReplayBuffer(buffer_shapes, dtypes, buffer_size=1_000_000)
-q_target = TargetNetwork(q_network, tau=1e-4).cuda()
-ae_target = TargetNetwork(double_autoencoder, tau=3e-5).cuda()
+q_target = TargetNetwork(q_network, tau=1e-4).to(config.device)
+ae_target = TargetNetwork(double_autoencoder, tau=3e-5).to(config.device)
 eps = 1
 eps_decay = 0.99
 eps_min = 0.1
@@ -119,11 +50,11 @@ def dqn_loss(q_network, q_target, obs, action, reward, next_obs, done, q_opt):
 def model_losses(q_network, q_target, double_autoencoder, ae_target, buffer, q_opt, double_ae_opt, batch_size=256):
     ae_target.update()
     obs, action, reward, next_obs, done = buffer.sample(batch_size)
-    obs = (torch.as_tensor(obs).float().transpose(-3, -1) / 255).cuda()
-    action = torch.as_tensor(action).long().cuda()
-    reward = torch.as_tensor(reward).float().cuda()
-    next_obs = (torch.as_tensor(next_obs).float().transpose(-3, -1) / 255).cuda()
-    done = torch.as_tensor(done).float().cuda()
+    obs = (torch.as_tensor(obs).float().transpose(-3, -1) / 255).to(config.device)
+    action = torch.as_tensor(action).long().to(config.device)
+    reward = torch.as_tensor(reward).float().to(config.device)
+    next_obs = (torch.as_tensor(next_obs).float().transpose(-3, -1) / 255).to(config.device)
+    done = torch.as_tensor(done).float().to(config.device)
     intrinsic = ae_target.net.double_encode(obs)
     next_intrinsic = ae_target.net.double_encode(next_obs).detach()
     q_loss = dqn_loss(q_network, q_target, intrinsic.detach(), action, reward, next_intrinsic, done, q_opt)
@@ -155,7 +86,7 @@ for episode in range(1, num_episodes + 1):
     while not done:
         step += 1
         if step > train_after:
-            obs_tensor = (torch.tensor(obs).float().transpose(-3, -1) / 255).cuda()
+            obs_tensor = (torch.tensor(obs).float().transpose(-3, -1) / 255).to(config.device)
             if np.random.rand() < eps:
                 action = np.random.randint(num_actions)
             else:

@@ -3,8 +3,6 @@ from torch import nn
 import torch.nn.functional as F
 from rltesting.torch_rl.models import MLP
 import numpy as np
-import skdim
-import scipy
 
 def compute_pad(kernel_size, stride):
     return int(np.ceil((kernel_size - stride) / 2))
@@ -46,11 +44,11 @@ class DecoderConv(nn.Module):
         return self.layers(x)
 
 class Encoder(nn.Module):
-    def __init__(self, framestack, latent_dim, image_dim, filter_base=8):
+    def __init__(self, framestack, latent_dim, image_dim, image_channels=3, filter_base=8):
         super().__init__()
-        self.conv = EncoderConv(filter_base=filter_base, image_channels=3 * framestack, input_size=image_dim) # 256, 4x4
+        self.conv = EncoderConv(filter_base=filter_base, image_channels=image_channels * framestack, input_size=image_dim) # 256, 4x4
         self.conv_dim = self.conv.output_size
-        self.out = nn.Linear(np.prod(self.conv.output_size), latent_dim) #MLP(np.prod(self.conv.output_size), latent_dim, 1024, skip_connections=False)
+        self.out = nn.Linear(np.prod(self.conv.output_size), latent_dim)
     
     def forward(self, x):
         x = self.conv(x)
@@ -59,11 +57,11 @@ class Encoder(nn.Module):
         return x
 
 class Decoder(nn.Module):
-    def __init__(self, conv_dim, framestack, latent_dim, filter_base=8):
+    def __init__(self, conv_dim, framestack, latent_dim, image_channels=3, filter_base=8):
         super().__init__()
         self._in = nn.Linear(latent_dim, np.prod(conv_dim))
         self.conv_dim = conv_dim
-        self.conv = DecoderConv(filter_base=filter_base, image_channels=3 * framestack)
+        self.conv = DecoderConv(filter_base=filter_base, image_channels=image_channels * framestack)
     
     def forward(self, x):
         x = self._in(x)
@@ -106,8 +104,3 @@ class DoubleAutoEncoder(nn.Module):
         int_ = self.double_encode(image)
         reconstruction = self.double_decode(int_)
         return F.mse_loss(image, reconstruction)
-
-
-# class LevinaBickelAlgorithm:
-#     def __init__(self, samples):
-        

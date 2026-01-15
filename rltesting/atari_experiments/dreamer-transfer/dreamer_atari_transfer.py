@@ -2,8 +2,7 @@ from rltesting.utils.logger import Logger
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import SubprocVecEnv
 from rltesting.torch_rl.dreamer.dreamer_atari import *
-from rltesting.torch_rl.utils import load_config, flatten
-from types import SimpleNamespace
+from rltesting.torch_rl.utils import load_config, simple_process_config
 
 def load_encoder(dreamer, encoder_path):
     pretrained_encoder_state = torch.load(encoder_path, map_location="cpu", weights_only=False)
@@ -26,8 +25,7 @@ def load_decoder(dreamer, decoder_path):
     dreamer.world_model.decoder.load_state_dict(wm_decoder_state)
         
 def process_config(config):
-    config = flatten(config)
-    config = SimpleNamespace(**config)
+    config = simple_process_config(config)
     if config.act == "silu":
         config.act = nn.SiLU
     elif config.act == "gelu":
