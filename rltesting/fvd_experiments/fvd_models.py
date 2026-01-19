@@ -104,3 +104,44 @@ class DoubleAutoEncoder(nn.Module):
         int_ = self.double_encode(image)
         reconstruction = self.double_decode(int_)
         return F.mse_loss(image, reconstruction)
+
+class AEVAE(DoubleAutoEncoder):
+    def __init__(self, encoder, decoder, latent_dim, intrinsic_dim, hidden_dim=256, penalty_coef=1e-3):
+        super().__init__(encoder, decoder, latent_dim, intrinsic_dim, hidden_dim)
+        # treat intrinsic_encoder as producing the mean
+        self.penalty_coef = penalty_coef
+        self.intrinsic_encoder_logvar = MLP(latent_dim, intrinsic_dim, hidden_dim, act=nn.GELU, skip_connections=False)
+    
+    def double_encode(self, image):
+        latent = self.encoder(image)
+        intrinsic_mu = self.intrinsic_encoder(latent)
+        intrinsic_logvar = self.intrinsic_encoder_logvar(latent)
+        intrinsic = reparameterize(intrinsic_mu, intrinsic_logvar)
+        return intrinsic
+    
+    def double_decode(self, intrinsic):
+        reconstructed_latent = self.intrinsic_decoder(intrinsic)
+        reconstructed = self.decoder(reconstructed_latent)
+        return reconstructed
+    
+    def compute_intrinsic(self, latent):
+        intrinsic_mu = self.intrinsic_encoder(latent)
+        intrinsic_logvar = self.intrinsic_encoder_logvar(latent)
+        intrinsic = reparameterize(intrinsic_mu, intrinsic_logvar)
+        return intrinsic
+    
+    def reconstruction_loss(self, image):
+        latent = self.encoder(image)
+        intrinsic_mu = self.intrinsic_encoder(latent)
+        intrinsic_logvar = self.intrinsic_encoder_logvar(latent)
+        intrinsic = reparameterize(intrinsic_mu, intrinsic_logvar)
+        reconstruction = self.double_decode(intrinsic)
+        return F.mse_loss(image, reconstruction) + vae_kl(intrinsic_mu, intrinsic_logvar).sum(-1).mean() * self.penalty_coef
+
+def vae_kl(mu, logvar):
+    return 0.5 * (-logvar - 1 + torch.exp(logvar) + mu ** 2)
+
+def reparameterize(mu, logvar):
+    eps = torch.randn_like(mu)
+    z = mu * torch.exp(logvar * 0.5) + eps 
+    return z

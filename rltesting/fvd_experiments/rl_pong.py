@@ -4,7 +4,8 @@ from rltesting.torch_rl.utils import load_config, simple_process_config
 from rltesting.torch_rl.buffers import ReplayBuffer
 from rltesting.torch_rl.models import MLP, TargetNetwork
 from rltesting.utils.logger import Logger
-from fvd_models import Encoder, Decoder, DoubleAutoEncoder
+from fvd_models import Encoder, Decoder
+import gymnasium as gym
 import torch.nn.functional as F
 import numpy as np
 import torch
@@ -19,9 +20,13 @@ encoder = Encoder(config.framestack, config.latent_dim, config.image_size, num_c
 decoder = Decoder(encoder.conv_dim, config.framestack, config.latent_dim, num_channels).to(config.device)
 double_autoencoder = load_or_create_model(config, encoder, decoder)
     
-env = make_env(config.env_type, config.env_id, config.framestack, config.image_size, config.grayscale)
+num_envs = 16
+train_every = 4
+env = gym.vector.SyncVectorEnv([
+    lambda: make_env(config.env_type, config.env_id, config.framestack, config.image_size, config.grayscale) for _ in range(num_envs)
+])
 
-num_actions = env.action_space.n
+num_actions = env.single_action_space.n
 q_network = MLP(double_autoencoder.intrinsic_dim, num_actions, skip_connections=False).to(config.device)
 int_opt = torch.optim.Adam(double_autoencoder.parameters(), 3e-4)
 q_opt = torch.optim.Adam(q_network.parameters(), 3e-4)
@@ -36,6 +41,8 @@ eps_min = 0.1
 num_episodes = 10000
 train_after = 10000
 gamma = 0.99
+
+num_iters = num_envs // train_every
 
 def dqn_loss(q_network, q_target, obs, action, reward, next_obs, done, q_opt):
     q_target.update()
@@ -92,21 +99,23 @@ for episode in range(1, num_episodes + 1):
             else:
                 intrinsic = double_autoencoder.double_encode(obs_tensor.unsqueeze(0))
                 action = to_numpy(q_network(intrinsic).argmax())
-            q_loss, ae_loss = model_losses(q_network, q_target, double_autoencoder, ae_target, dqn_buffer, q_opt, int_opt)
-            q_loss_.append(q_loss)
-            ae_loss_.append(ae_loss)
+            for _ in range(num_iters):
+                q_loss, ae_loss = model_losses(q_network, q_target, double_autoencoder, ae_target, dqn_buffer, q_opt, int_opt)
+                q_loss_.append(q_loss)
+                ae_loss_.append(ae_loss)
         else:
             action = env.action_space.sample()
-        next_obs, reward, term, trunc, _ = env.step(action)
-        done = term or trunc
-        dqn_buffer.add_sample([obs, action, reward, next_obs, done])
-        ep_rew += reward
+        next_obs, reward, term, trunc, info = env.step(action)
+        for i in range(num_envs):
+            dqn_buffer.add_sample([obs[i], action[i], reward[i], next_obs[i], term[i]])
+        if term.any() or trunc.any():
+            ep_rew = np.sum(info['episode']['r']) / np.sum(term + trunc)
+            logger.add_scalar('ep_rew', ep_rew)
         obs = next_obs
-    logger.add_scalar('ep_rew', ep_rew)
     logger.add_scalar('q_loss', np.mean(q_loss_))
     logger.add_scalar('autoencoder_loss', np.mean(ae_loss_))
     logger.write(episode)
-    ep_rews.append(ep_rew)
+    # ep_rews.append(ep_rew)
     q_losses.append(np.mean(q_loss_))
     ae_losses.append(np.mean(ae_loss_))
     if ep_rew_ema is None:

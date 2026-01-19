@@ -1,6 +1,6 @@
 from wrapper import BasicEnvironmentRGB, DomainRandomization
 import gymnasium as gym
-from gymnasium.wrappers import FrameStackObservation, TransformObservation, ResizeObservation, GrayscaleObservation
+from gymnasium.wrappers import FrameStackObservation, TransformObservation, ResizeObservation, GrayscaleObservation, RecordEpisodeStatistics
 from rltesting.torch_rl.utils import to_numpy
 import numpy as np
 import torch
@@ -45,6 +45,7 @@ def make_env(env_type, env_id, framestack, image_size, grayscale):
         lambda obs: np.reshape(obs, (image_size, image_size, num_channels * framestack)), 
         observation_space=gym.spaces.Box(0, 255, (image_size, image_size, num_channels * framestack), dtype=np.uint8)
         )
+    env = RecordEpisodeStatistics(env)
     return env 
 
 def dqn_loss(q_network, q_target, buffer, q_opt, batch_size=512, gamma=0.99):

@@ -8,7 +8,7 @@ import torch
 import skdim
 import os
 
-def pretrain(config, encoder, decoder, reconstruction_loss, penalty=None):
+def pretrain(config, encoder, decoder, reconstruction_loss, intrinsic_autoencoder_class=DoubleAutoEncoder):
     framestack = config.framestack
     latent_dim = config.latent_dim
     image_size = config.image_size
@@ -41,8 +41,6 @@ def pretrain(config, encoder, decoder, reconstruction_loss, penalty=None):
         latent = encoder(obs)
         reconstruction = decoder(latent)
         loss = reconstruction_loss(reconstruction, obs)
-        if penalty is not None:
-            loss += penalty(latent)
         loss.backward()
         opt.step()
         opt.zero_grad()
@@ -65,7 +63,7 @@ def pretrain(config, encoder, decoder, reconstruction_loss, penalty=None):
     print(f"Image ID: {np.mean(image_ID)} +- {np.std(image_ID)}")
 
     intrinsic_dim = round(scale_factor * np.mean(latent_ID))
-    double_autoencoder = DoubleAutoEncoder(encoder, decoder, latent_dim, intrinsic_dim).to(device)
+    double_autoencoder = intrinsic_autoencoder_class(encoder, decoder, latent_dim, intrinsic_dim).to(device)
     int_opt = torch.optim.AdamW(double_autoencoder.parameters(), lr)
 
     losses = []
@@ -76,7 +74,7 @@ def pretrain(config, encoder, decoder, reconstruction_loss, penalty=None):
         obs = (torch.tensor(samples[0]).float().transpose(-3, -1) / 255).to(device)
         intrinsic = double_autoencoder.double_encode(obs)
         reconstruction = double_autoencoder.double_decode(intrinsic)
-        loss = reconstruction_loss(reconstruction, obs)
+        loss = double_autoencoder.reconstruction_loss(reconstruction, obs)
         loss.backward()
         int_opt.step()
         int_opt.zero_grad()
