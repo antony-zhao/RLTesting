@@ -14,7 +14,7 @@ def compute_pad(kernel_size, stride):
 
 class MLP(nn.Module):
     # if hidden dims is specified then doesn't use skip connections
-    def __init__(self, input_dim, output_dim, hidden_dim=256, num_hiddens=2, act=nn.SiLU, hidden_dims=None, final_act=None, skip_connections=None):
+    def __init__(self, input_dim, output_dim, hidden_dim=256, num_hiddens=2, act=nn.GELU, hidden_dims=None, final_act=None, skip_connections=None):
         super().__init__()
         if hidden_dims is not None:
             assert len(hidden_dims) + 1 == num_hiddens
@@ -50,29 +50,23 @@ class MLP(nn.Module):
         return logits
 
 class ResBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, stride=1, act=nn.SiLU):
+    def __init__(self, in_channels, out_channels, kernel_size, act=nn.GELU):
         super().__init__()
         padding = int((kernel_size - 1) // 2)
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size, 1, padding)
-        if stride > 1:
-            self.skip = nn.Conv2d(in_channels, out_channels, 1, stride)
-        else:
-            self.skip = None
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size, padding=padding)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size, padding=padding)
         self.act = act()
     
     def forward(self, x):
         x_skip = x.clone()
         x = self.act(self.conv1(x))
         x = self.act(self.conv2(x))
-        if self.skip is not None:
-            x_skip = self.skip(x_skip)
         return x + x_skip
 
 class NatureCNN(nn.Module):
     # from the original Nature DQN paper
     # assumes the 84x84 grayscale and 4 frame stack
-    def __init__(self, act=nn.SiLU, flatten_out=False, input_channels=4):
+    def __init__(self, act=nn.GELU, flatten_out=False, input_channels=4):
         super().__init__()
         self.convs = nn.Sequential(
             nn.Conv2d(input_channels, 32, 8, stride=4),
@@ -98,10 +92,37 @@ class NatureCNN(nn.Module):
             return x
 
 class IMPALABlock(nn.Module):
-    pass
+    def __init__(self, in_channels, out_channels, act=nn.GELU):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.pool1 = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        self.res1 = ResBlock(out_channels, out_channels, 3, act)
+        self.res2 = ResBlock(out_channels, out_channels, 3, act)
+        self.act = act()
+        
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.pool1(x)
+        x = self.res1(x)
+        x = self.res2(x)
+        return x
 
 class IMPALACNN(nn.Module):
-    pass
+    def __init__(self, image_size, num_blocks, image_channels=3, channel_base=16, act=nn.GELU):
+        channels = [image_channels] + [channel_base * 2 ** i for i in range(num_blocks)]
+        self.image_size = image_size
+        self.image_channels = image_channels
+        super().__init__()
+        self.layers = nn.Sequential(*[IMPALABlock(channels[i], channels[i + 1], act) for i in range(num_blocks)])
+        self.output_dim = self.compute_output_dim()
+    
+    def compute_output_dim(self):
+        x = torch.zeros(1, self.image_channels, self.image_size, self.image_size)
+        x = self.layers(x)
+        return x.view(-1).shape[0]
+    
+    def forward(self, obs):
+        return self.layers(obs)
 
 class ChannelNorm(nn.Module):
     def __init__(self, num_channels, eps=1e-5):

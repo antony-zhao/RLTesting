@@ -3,7 +3,7 @@ from torch import nn
 import torch.nn.functional as F
 import numpy as np
 
-from rltesting.torch_rl.models import MLP, NatureCNN, layer_init
+from rltesting.torch_rl.models import MLP, NatureCNN, layer_init, IMPALACNN
 from rltesting.torch_rl.ppo.ppo import compute_gae, PPONetwork, AtariPolicyNetwork
 from rltesting.utils.torch_utils import to_numpy, get_action_dim, get_obs_shape
 
@@ -72,7 +72,7 @@ class RND(nn.Module):
 class AtariFeatureModel(nn.Module):
     def __init__(self, feature_dim=512, num_hidden=1):
         super(AtariFeatureModel, self).__init__()
-        self.conv = NatureCNN(input_channels=1)
+        self.conv =  NatureCNN(input_channels=1) # IMPALACNN(image_size=84, num_blocks=3, image_channels=1)
         self.mlp = MLP(self.conv.output_dim, feature_dim, num_hiddens=num_hidden)
     
     def forward(self, obs):

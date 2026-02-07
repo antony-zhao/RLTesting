@@ -54,13 +54,10 @@ def main(args):
         num_completed = 0
         frames = []
         while not done:
-            obs = obs#(obs - rms.mean) / (np.sqrt(rms.var) + 1e-8)
             obs = torch.as_tensor(obs).to(device).float()
             intrinsic_reward, _ = rnd.compute_intrinsic(obs)
-            # total_reward += np.sum(intrinsic_reward)
             action, _ = ppo_network.policy_network.policy_fn(obs, det=False)
             obs, reward, done, infos = eval_env.step(to_numpy(action))
-            total_reward += reward
             frames.append(eval_env.render())
             for info in infos:
                 if 'episode' in info.keys():
@@ -116,7 +113,7 @@ def main(args):
                 logger.add_scalar('eval_reward', eval_reward)
                 imageio.mimwrite(f'gifs/{args.env}_{i}.gif', frames[::4], loop=0, fps=20)
             logger.write(i * args.num_envs * args.rollout_length)
-    
+        torch.save(AtariPolicyNetwork, f'{env}_model.pt')
     
 if __name__ == '__main__':
     from argparse import ArgumentParser
@@ -130,7 +127,7 @@ if __name__ == '__main__':
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--rollout-length', type=int, default=128)
     parser.add_argument('--num-envs', type=int, default=128)
-    parser.add_argument('--timesteps', type=int, default=50_000_000)
+    parser.add_argument('--timesteps', type=int, default=1_000_000_000)
     parser.add_argument('--log-every', type=int, default=4)
     parser.add_argument('--num-epochs', type=int, default=4)
     parser.add_argument('--num-minibatches', type=int, default=4)
