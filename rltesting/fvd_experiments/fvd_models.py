@@ -100,13 +100,13 @@ class DoubleAutoEncoder(nn.Module):
     def reconstruct_image(self, latent):
         return self.decoder(latent)
     
-    def reconstruction_loss(self, image):
+    def reconstruction_loss(self, image, eps=1e-6):
         int_ = self.double_encode(image)
         reconstruction = self.double_decode(int_)
-        return F.mse_loss(image, reconstruction)
+        return F.mse_loss(image, reconstruction) #torch.sqrt((image - reconstruction) ** 2 + eps).mean() #
 
 class AEVAE(DoubleAutoEncoder):
-    def __init__(self, encoder, decoder, latent_dim, intrinsic_dim, hidden_dim=256, penalty_coef=1e-3):
+    def __init__(self, encoder, decoder, latent_dim, intrinsic_dim, hidden_dim=256, penalty_coef=1e-5):
         super().__init__(encoder, decoder, latent_dim, intrinsic_dim, hidden_dim)
         # treat intrinsic_encoder as producing the mean
         self.penalty_coef = penalty_coef
@@ -130,13 +130,14 @@ class AEVAE(DoubleAutoEncoder):
         intrinsic = reparameterize(intrinsic_mu, intrinsic_logvar)
         return intrinsic
     
-    def reconstruction_loss(self, image):
+    def reconstruction_loss(self, image, eps=1e-6):
         latent = self.encoder(image)
         intrinsic_mu = self.intrinsic_encoder(latent)
         intrinsic_logvar = self.intrinsic_encoder_logvar(latent)
         intrinsic = reparameterize(intrinsic_mu, intrinsic_logvar)
         reconstruction = self.double_decode(intrinsic)
         return F.mse_loss(image, reconstruction) + vae_kl(intrinsic_mu, intrinsic_logvar).sum(-1).mean() * self.penalty_coef
+        # return torch.sqrt((image - reconstruction) ** 2 + eps).mean() + vae_kl(intrinsic_mu, intrinsic_logvar).sum(-1).mean() * self.penalty_coef
 
 def vae_kl(mu, logvar):
     return 0.5 * (-logvar - 1 + torch.exp(logvar) + mu ** 2)

@@ -32,8 +32,6 @@ class ReplayBuffer:
             indices %= self.buffer_size
             indices = indices.transpose()
         sampled = [buffer[indices] for buffer in self.buffers]
-        if batch_size > 0  and sampled[1].max() >= 18:
-            print('hi')
         return sampled
     
     def add_sample(self, sample):

@@ -74,23 +74,23 @@ def pretrain(config, encoder, decoder, reconstruction_loss, intrinsic_autoencode
         obs = (torch.tensor(samples[0]).float().transpose(-3, -1) / 255).to(device)
         intrinsic = double_autoencoder.double_encode(obs)
         reconstruction = double_autoencoder.double_decode(intrinsic)
-        loss = double_autoencoder.reconstruction_loss(reconstruction, obs)
+        loss = double_autoencoder.reconstruction_loss(obs)
         loss.backward()
         int_opt.step()
         int_opt.zero_grad()
-        opt.step()
-        opt.zero_grad()
+        # opt.step()
+        # opt.zero_grad()
         losses.append(loss.detach().cpu().numpy())
     
     torch.save(double_autoencoder, config.model_path)
     return double_autoencoder
 
-def load_or_create_model(config, encoder, decoder):
+def load_or_create_model(config, encoder, decoder, intrinsic_autoencoder_class=DoubleAutoEncoder):
     if os.path.exists(config.model_path):
         model = torch.load(config.model_path, map_location=config.device, weights_only=False)
         print("Model Loaded")
         return model
     else:
-        double_autoencoder = pretrain(config, encoder, decoder, F.mse_loss)
+        double_autoencoder = pretrain(config, encoder, decoder, F.mse_loss, intrinsic_autoencoder_class)
         print("Done Pretraining")
         return double_autoencoder
