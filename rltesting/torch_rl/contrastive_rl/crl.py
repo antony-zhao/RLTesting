@@ -5,20 +5,8 @@ from torch.nn import functional as F
 from rltesting.torch_rl.models import MLP, IMPALACNN
 from torch.optim import Adam
 from torch.distributions import Normal, Categorical
-
-class TrajectoryBuffer:
-    def __init__(self, buffer_size=1_000_000, num_envs=16):
-        self.action_buffer = np.empty()
-        self.state_buffer = np.empty()
-        self.done_buffer = np.empty()
-    
-    def sample_triplet(self, batch_size=256):
-        # returns the (s_t, a_t, s_f+) triplet
-        pass
-    
-    def sample_goals(self, batch_size=256):
-        # return random states
-        pass
+from collections import deque
+        
 
 class Encoder(nn.Module):
     def __init__(self, input_dim, output_dim=64, hidden_dim=256, depth=4, act=nn.GELU):
