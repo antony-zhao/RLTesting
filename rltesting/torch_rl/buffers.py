@@ -1,6 +1,10 @@
 import numpy as np
 import torch
 
+class SumTree:
+    # for future prioritized replay purposes
+    pass
+
 class ReplayBuffer:
     # The vanilla replay buffer
     def __init__(self, buffer_shapes=[], dtypes=None, buffer_size=1_000_000, prioritized=False, done_index=-1):
@@ -18,15 +22,20 @@ class ReplayBuffer:
         self.weights = np.zeros(buffer_size) if prioritized else None
         self.done_index = done_index
     
-    def sample(self, batch_size, seq_len=1):
-        # can do a thing where the valid indices go from [0, pos - seq_len) and [pos, buffer_size-seq_len] to prevent the
-        # out of order sampling, instead of needing to wait for episode to terminate
+    def sample_indices(self, batch_size, seq_len=1):
         if self.weights is None:
             if self.total < self.buffer_size:
                 indices = np.random.randint(0, min(self.total - seq_len, self.buffer_size), size=batch_size)
             else:
                 valid_indices = list(range(0, self.index - seq_len)) + list(range(self.index, self.buffer_size))
                 indices = np.random.choice(valid_indices, size=batch_size)
+        return indices
+    
+    def sample(self, batch_size=256, seq_len=1, indices=None):
+        # can do a thing where the valid indices go from [0, pos - seq_len) and [pos, buffer_size-seq_len] to prevent the
+        # out of order sampling, instead of needing to wait for episode to terminate
+        if indices is None:
+            indices = self.sample_indices(batch_size, seq_len)
         if seq_len > 1:
             indices = np.expand_dims(indices, axis=-1) + np.arange(seq_len)
             indices %= self.buffer_size
@@ -68,12 +77,157 @@ class ReplayBuffer:
     def modify_weights(self, indices, weights):
         raise NotImplemented
     
-    def store_as_dataset(self, filename):
-        pass
+    def get_state(self):
+        state = {
+            'index': self.index,
+            'total': self.total,
+            'weights': self.weights if self.weights is not None else np.array([])
+        }
+
+        for i, buf in enumerate(self.buffers):
+            state[f'buffer_{i}'] = buf
+            
+        return state
     
+    def save(self, filepath):
+        np.savez_compressed(filepath, **self.get_state())
+        
+    def set_state(self, state):
+        self.index = int(state['index'])
+        self.total = int(state['total'])
+        self.weights = state['weights'] if state['weights'].size > 0 else None
+        
+        for i in range(len(self.buffers)):
+            self.buffers[i] = state[f'buffer_{i}']
+        
+    def load(self, filepath):
+        with np.load(filepath, allow_pickle=True) as state:
+            self.set_state(state)
+        
+class TrajectoryReplayBuffer(ReplayBuffer):
+    # Serves as both the vanilla replay buffer but can also sample things from within the same trajectory for things like goal-based RL
+    def __init__(self, obs_index=0, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        
+        self.obs_index = obs_index
+        self.indices = np.empty((self.buffer_size, 2), dtype=np.int32)
+        self.trajectory_idx = 0
+        self.t = 0
+        self.trajectory_ends = {}
+    
+    def add_sample(self, sample):
+        if self.total >= self.buffer_size:
+            old_traj_idx = self.indices[self.index, 0]
+            if self.trajectory_ends.get(old_traj_idx) == self.index:
+                self.trajectory_ends.pop(old_traj_idx, None)
+                
+        self.indices[self.index] = [self.trajectory_idx, self.t]
+
+        if sample[self.done_index] == True:
+            self.trajectory_ends[self.trajectory_idx] = self.index
+            self.trajectory_idx += 1
+            self.t = 0
+        else:
+            self.t += 1
+            
+        super().add_sample(sample)
+    
+    def add_samples(self, data_samples):
+        num_steps = data_samples[0].shape[0]
+        write_indices = (self.index + np.arange(num_steps)) % self.buffer_size
+        
+        if self.total >= self.buffer_size:
+            old_traj_ids = self.indices[write_indices, 0]
+            for i in range(num_steps):
+                old_id = old_traj_ids[i]
+                if self.trajectory_ends.get(old_id) == write_indices[i]:
+                    self.trajectory_ends.pop(old_id, None)
+        
+        # pre-allocate the array
+        tracking_data = np.zeros((num_steps, 2), dtype=np.int32)
+        
+        for i in range(num_steps):
+            tracking_data[i] = [self.trajectory_idx, self.t]
+            if data_samples[self.done_index][i] == True:
+                self.trajectory_ends[self.trajectory_idx] = write_indices[i]
+                self.trajectory_idx += 1
+                self.t = 0
+            else:
+                self.t += 1
+                
+        self.indices[write_indices] = tracking_data
+        
+        super().add_samples(data_samples)
+    
+    def sample_goals(self, indices, discount=0.99):
+        # samples a future state, weighted by a discount based on how far they are from the current state
+        goal_indices = np.zeros_like(indices)
+        
+        for i, start_idx in enumerate(indices):
+            target_traj_idx = self.indices[start_idx, 0]
+            
+            end_idx = self.trajectory_ends.get(
+                target_traj_idx, 
+                (self.index - 1) % self.buffer_size
+            )
+            
+            # handling circular indice
+            if start_idx <= end_idx:
+                future_indices = np.arange(start_idx + 1, end_idx + 1)
+            else:
+                future_indices = np.concatenate([
+                    np.arange(start_idx + 1, self.buffer_size),
+                    np.arange(0, end_idx + 1)
+                ])
+                
+            # edge case of using the last step, in which case the goal is itself
+            if len(future_indices) == 0:
+                goal_indices[i] = start_idx
+                continue
+                
+            distances = np.arange(1, len(future_indices) + 1)
+            weights = discount ** distances
+            weights = weights / np.sum(weights) # Normalize
+            
+            goal_indices[i] = np.random.choice(future_indices, p=weights)
+            
+        return self.buffers[self.obs_index][goal_indices]
+
+    def sample_with_goals(self, batch_size=256, seq_len=1):
+        indices = self.sample_indices(batch_size, seq_len)
+        data = self.sample(indices=indices)
+        goals = self.sample_goals(indices)
+        return data, goals
+
+    def get_state(self):
+        state = super().get_state()
+        
+        state['indices'] = self.indices
+        state['trajectory_idx'] = self.trajectory_idx
+        state['t'] = self.t
+        
+        state['trajectory_bounds'] = np.array([self.trajectory_bounds], dtype=object)
+        
+        return state
+
+    def set_state(self, state):
+        super().set_state(state)
+        
+        self.indices = state['indices']
+        self.trajectory_idx = int(state['trajectory_idx'])
+        self.t = int(state['t'])
+        
+        self.trajectory_bounds = state['trajectory_bounds'][0]
+
 class PerEnvBuffer:
-    def __init__(self, num_envs, buffer_shapes=[], dtypes=None, buffer_size=1_000_000, prioritized=False):
-        self.buffers = [ReplayBuffer(buffer_shapes, dtypes, buffer_size // num_envs, prioritized) for _ in range(num_envs)]
+    def __init__(self, num_envs, buffer_shapes=[], dtypes=None, buffer_size=1_000_000, prioritized=False, buffer_class=ReplayBuffer):
+        self.buffers = [
+            buffer_class(
+                buffer_shapes, 
+                dtypes, 
+                buffer_size // num_envs, 
+                prioritized) for _ in range(num_envs)
+        ]
         self.num_envs = num_envs
         self.num_items = len(buffer_shapes)
     
@@ -88,7 +242,7 @@ class PerEnvBuffer:
             self.buffers[i].add_sample_until_episode_terminal([s[i] for s in sample])
     
     def sample(self, batch_size, seq_len=1):
-        per_env_batch = np.bincount(np.random.randint(0, self.num_envs, batch_size))
+        per_env_batch = np.bincount(np.random.randint(0, self.num_envs, batch_size), minlength=self.num_envs)
         per_env_samples = [self.buffers[i].sample(batch_sizes, seq_len) for i, batch_sizes in enumerate(per_env_batch)]
         samples = []
         for i in range(self.num_items):
@@ -101,4 +255,68 @@ class PerEnvBuffer:
         
         samples_tensor = [torch.tensor(sample).to(device).float() for sample in samples]
         return samples_tensor
+    
+    def save(self, filepath):
+        global_state = {}
         
+        for i, buf in enumerate(self.buffers):
+            env_state = buf.get_state()
+            for key, value in env_state.items():
+                global_state[f"env_{i}_{key}"] = value
+                
+        np.savez_compressed(filepath, **global_state)
+
+    def load(self, filepath):
+        with np.load(filepath, allow_pickle=True) as global_state:
+            for i, buf in enumerate(self.buffers):
+                
+                prefix = f"env_{i}_"
+                env_state = {
+                    key.replace(prefix, ""): global_state[key] 
+                    for key in global_state.files 
+                    if key.startswith(prefix)
+                }
+                
+                buf.set_state(env_state)
+                
+class PerEnvTrajectoryBuffer(PerEnvBuffer):
+    def __init__(self, num_envs, buffer_shapes=[], dtypes=None, buffer_size=1_000_000, prioritized=False, **kwargs):
+        super().__init__(
+            num_envs=num_envs, 
+            buffer_class=TrajectoryReplayBuffer, 
+            buffer_shapes=buffer_shapes, 
+            dtypes=dtypes, 
+            buffer_size=buffer_size, 
+            prioritized=prioritized, 
+            **kwargs
+        )
+
+    def sample_with_goals(self, batch_size, seq_len=1, discount=0.99):
+        per_env_batch = np.bincount(np.random.randint(0, self.num_envs, batch_size), minlength=self.num_envs)
+        
+        per_env_samples = []
+        per_env_goals = []
+        for i, env_batch_size in enumerate(per_env_batch):
+            if env_batch_size > 0:
+                data, goal = self.buffers[i].sample_with_goals(env_batch_size, seq_len, discount)
+                per_env_samples.append(data)
+                per_env_goals.append(goal)
+        
+        # Determine how many items the sub-buffer actually returned 
+        # (e.g., states, actions, rewards, next_states, AND goals)
+        num_returned_items = len(per_env_samples[0])
+        
+        samples = []
+        goals = []
+        for i in range(num_returned_items):
+            samples.append(np.concatenate([sample[i] for sample in per_env_samples], axis=0 if seq_len == 1 else 1))
+            goals.append(np.concatenate([goal[i] for goal in per_env_goals], axis=0 if seq_len == 1 else 1))
+        
+        return samples, goals
+
+    def sample_with_goals_as_tensors(self, device, batch_size, seq_len=1, discount=0.99):
+        samples, goals = self.sample_with_goals(batch_size, seq_len, discount)
+        samples_tensors = [torch.tensor(sample).to(device).float() for sample in samples]
+        goals_tensors = [torch.tensor(goal).to(device).float() for goal in goals]
+        return samples_tensors, goals_tensors
+    
