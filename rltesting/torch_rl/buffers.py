@@ -164,7 +164,7 @@ class TrajectoryReplayBuffer(ReplayBuffer):
         goal_indices = np.zeros_like(indices)
         
         for i, start_idx in enumerate(indices):
-            target_traj_idx = self.indices[start_idx, 0]
+            target_traj_idx = self.indices[start_idx][0]
             
             end_idx = self.trajectory_ends.get(
                 target_traj_idx, 
@@ -193,10 +193,10 @@ class TrajectoryReplayBuffer(ReplayBuffer):
             
         return self.buffers[self.obs_index][goal_indices]
 
-    def sample_with_goals(self, batch_size=256, seq_len=1):
+    def sample_with_goals(self, batch_size=256, seq_len=1, discount=0.99):
         indices = self.sample_indices(batch_size, seq_len)
         data = self.sample(indices=indices)
-        goals = self.sample_goals(indices)
+        goals = self.sample_goals(indices, discount)
         return data, goals
 
     def get_state(self):
@@ -223,10 +223,10 @@ class PerEnvBuffer:
     def __init__(self, num_envs, buffer_shapes=[], dtypes=None, buffer_size=1_000_000, prioritized=False, buffer_class=ReplayBuffer):
         self.buffers = [
             buffer_class(
-                buffer_shapes, 
-                dtypes, 
-                buffer_size // num_envs, 
-                prioritized) for _ in range(num_envs)
+                buffer_shapes=buffer_shapes, 
+                dtypes=dtypes, 
+                buffer_size=buffer_size // num_envs, 
+                prioritized=prioritized) for _ in range(num_envs)
         ]
         self.num_envs = num_envs
         self.num_items = len(buffer_shapes)
@@ -307,16 +307,15 @@ class PerEnvTrajectoryBuffer(PerEnvBuffer):
         num_returned_items = len(per_env_samples[0])
         
         samples = []
-        goals = []
         for i in range(num_returned_items):
             samples.append(np.concatenate([sample[i] for sample in per_env_samples], axis=0 if seq_len == 1 else 1))
-            goals.append(np.concatenate([goal[i] for goal in per_env_goals], axis=0 if seq_len == 1 else 1))
+        goals = np.concatenate(per_env_goals, axis=0)
         
         return samples, goals
 
     def sample_with_goals_as_tensors(self, device, batch_size, seq_len=1, discount=0.99):
         samples, goals = self.sample_with_goals(batch_size, seq_len, discount)
         samples_tensors = [torch.tensor(sample).to(device).float() for sample in samples]
-        goals_tensors = [torch.tensor(goal).to(device).float() for goal in goals]
-        return samples_tensors, goals_tensors
+        goals_tensor = torch.tensor(goals).to(device).float()
+        return samples_tensors, goals_tensor
     

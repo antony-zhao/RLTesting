@@ -257,3 +257,6 @@ class TargetNetwork(nn.Module):
     @property
     def net(self):
         return self.network
+
+def reparameterize_normal(mu, sigma):
+    return torch.randn_like(mu) * sigma + mu

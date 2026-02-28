@@ -182,3 +182,4 @@ ImageNet100
 .vscode
 *.ckpt
 *.pt
+*temp.py
