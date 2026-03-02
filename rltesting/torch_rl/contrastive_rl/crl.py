@@ -4,8 +4,9 @@ from torch import nn
 from torch.nn import functional as F
 from rltesting.torch_rl.models import MLP, IMPALACNN, reparameterize_normal
 from rltesting.torch_rl.buffers import PerEnvTrajectoryBuffer
+from rltesting.torch_rl.distributions import SafeTanhNormal
 from torch.optim import Adam
-from torch.distributions import Normal, Categorical        
+from torch.distributions import Normal, Categorical
 
 class Encoder(nn.Module):
     def __init__(self, input_dim, output_dim=64, hidden_dim=256, depth=4, act=nn.GELU):
@@ -19,7 +20,7 @@ class Encoder(nn.Module):
             self.conv_enc = IMPALACNN(input_dim[-1], depth-1, input_dim[0], act=act)
             self.out = nn.Linear(self.conv_enc.output_dim, output_dim)
         else:
-            self.out = MLP(input_dim[0], output_dim, hidden_dim, num_hiddens=depth, act=act)
+            self.out = MLP(input_dim[0], output_dim, hidden_dim, num_hiddens=depth, act=act, skip_connections=True)
             
     def forward(self, x):
         if self.is_image:
@@ -27,14 +28,14 @@ class Encoder(nn.Module):
         return self.out(x)
 
 class MultiEncoder(nn.Module):
-    def __init__(self, input_dims, depths, output_dim=64, hidden_dim=256, act=nn.GELU):
+    def __init__(self, input_dims, depths, final_depth=2, output_dim=64, hidden_dim=256, act=nn.GELU):
         super().__init__()
         self.num = len(input_dims)
         self.encoders = nn.ModuleList(
-            [Encoder(input_dims[i], output_dim, hidden_dim, depths[i] - 1) for i in range(self.num)]
+            [Encoder(input_dims[i], hidden_dim, hidden_dim, depths[i] - 1) for i in range(self.num)]
         )
         self.act = act()
-        self.out = nn.Linear(output_dim * self.num, output_dim)
+        self.out = MLP(hidden_dim * self.num, output_dim, hidden_dim, final_depth)
     
     def forward(self, xs):
         xs = [self.encoders[i](xs[i]) for i in range(self.num)]
@@ -43,17 +44,18 @@ class MultiEncoder(nn.Module):
         return x
     
 class PolicyModel(nn.Module):
-    def __init__(self, obs_dim, action_dim, action_type="continuous", hidden_dim=256):
+    def __init__(self, obs_dim, action_dim, action_type="continuous", hidden_dim=256, upscale=1.0):
         super().__init__()
         self.encoder = Encoder(obs_dim, hidden_dim, hidden_dim)
         self.goal_encoder = Encoder(obs_dim, hidden_dim, hidden_dim)
         self.action_type = action_type
+        self.upscale = upscale
         
         if action_type == "continuous":
-            self.policy_mu = MLP(hidden_dim * 2, action_dim[0])
+            self.policy_mu = MLP(hidden_dim * 2, action_dim[0], skip_connections=False)
             self.policy_logstd = nn.Parameter(torch.zeros(1, action_dim[0]))
         else:
-            self.policy = MLP(hidden_dim * 2, action_dim[0])
+            self.policy = MLP(hidden_dim * 2, action_dim[0], skip_connections=False)
     
     def policy_dist(self, obs, goal=None):
         x = self.encoder(obs)
@@ -63,8 +65,10 @@ class PolicyModel(nn.Module):
             goal_enc = torch.zeros_like(x).to(x.device)
         x = torch.cat([x, goal_enc], dim=-1)
         if self.action_type == "continuous":
-            mu = self.policy_mu(x) # TODO STRAIGHT THROUGH GRADIENTS FOR BOTH
-            return Normal(mu, self.policy_logstd.exp())
+            mu = self.policy_mu(x)
+            log_std = torch.clamp(self.policy_logstd, -20, 2)
+            dist = SafeTanhNormal(mu, log_std.exp())
+            return dist
         else:
             act_logits = self.policy(x)
             return Categorical(logits=act_logits)
@@ -78,38 +82,69 @@ class PolicyModel(nn.Module):
 class CRLAgent:
     def __init__(
         self, obs_dim, action_dim, num_envs, device, repr_dim=64, action_type="continuous", 
-        encoder_depth=4, buffer_size=1_000_000
+        obs_encoder_depth=1, action_encoder_depth=0, multi_encoder_depth=2, buffer_size=1_000_000, alpha=0.1
     ):
         self.device = device
-        self.sa_encoder = MultiEncoder(
-            (obs_dim, action_dim), depths=(encoder_depth, encoder_depth), output_dim=repr_dim
+        self.sa_encoder1 = MultiEncoder(
+            (obs_dim, action_dim), depths=(obs_encoder_depth, action_encoder_depth), output_dim=repr_dim, final_depth=multi_encoder_depth
         ).to(device)
-        self.g_encoder = Encoder(obs_dim, output_dim=repr_dim, depth=encoder_depth).to(device)
+        self.g_encoder1 = Encoder(obs_dim, output_dim=repr_dim, depth=obs_encoder_depth).to(device)
+        self.sa_encoder2 = MultiEncoder(
+            (obs_dim, action_dim), depths=(obs_encoder_depth, action_encoder_depth), output_dim=repr_dim, final_depth=multi_encoder_depth
+        ).to(device)
+        self.g_encoder2 = Encoder(obs_dim, output_dim=repr_dim, depth=obs_encoder_depth).to(device)
         self.policy = PolicyModel(obs_dim, action_dim, action_type).to(device)
-        self.sa_encoder_optim = Adam(self.sa_encoder.parameters(), 3e-4)
-        self.g_encoder_optim = Adam(self.g_encoder.parameters(), 3e-4)
+        self.critic_optim = Adam(
+            list(self.sa_encoder1.parameters()) + list(self.sa_encoder2.parameters()) +
+            list(self.g_encoder1.parameters()) + list(self.g_encoder2.parameters()), 
+            3e-4
+        )
         self.policy_optim = Adam(self.policy.parameters(), 3e-4)
         buffer_shapes = [obs_dim, action_dim, (1, ), obs_dim, (1, )]
         is_image = type(obs_dim) is tuple and len(obs_dim) > 1
         obs_type = np.float32 if not is_image else np.uint8
         dtypes = [obs_type, np.float32, np.float32, obs_type, np.bool]
+        self.target_entropy = -action_dim[0]
+        self.log_alpha = nn.Parameter(torch.tensor(0.0).to(device))
+        self.alpha_optim = Adam([self.log_alpha], 3e-4)
         self.buffer = PerEnvTrajectoryBuffer(num_envs, buffer_shapes, dtypes, buffer_size)
     
+    def critic_fn(self, obs, action, obs_f):
+        sa_repr1 = self.sa_encoder1([obs, action])
+        g_repr1 = self.g_encoder1(obs_f)
+        logits1 = torch.einsum('ik, jk -> ij', sa_repr1, g_repr1)
+        sa_repr2 = self.sa_encoder2([obs, action])
+        g_repr2 = self.g_encoder2(obs_f)
+        logits2 = torch.einsum('ik, jk -> ij', sa_repr2, g_repr2)
+        return torch.stack([logits1, logits2], dim=-1)
+    
     def critic_loss(self, obs, action, obs_f):
-        sa_repr = self.sa_encoder([obs, action])
-        g_repr = self.g_encoder(obs_f)
-        logits = torch.einsum('ik, jk -> ij', sa_repr, g_repr)
-        return F.binary_cross_entropy_with_logits(logits, torch.eye(logits.shape[0]).to(self.device), reduction='mean')
+        goal_obs = obs_f.clone()
+        goal_obs[:, 3:] = 0
+        logits = self.critic_fn(obs, action, goal_obs)
+        target = torch.eye(logits.shape[0]).to(self.device).unsqueeze(-1).expand_as(logits)
+        return F.binary_cross_entropy_with_logits(logits, target)
     
     def actor_loss(self, obs, goal):
         obs = torch.cat([obs, obs], dim=0)
         random_goals = torch.roll(goal, shifts=1, dims=0)
         goal = torch.cat([goal, random_goals], dim=0)
-        action = self.policy(obs, goal)
-        sa_repr = self.sa_encoder([obs, action])
-        g_repr = self.g_encoder(goal)
-        logits = torch.einsum('ik, ik -> i', sa_repr, g_repr)
-        return -logits.mean()
+        action_dist = self.policy.policy_dist(obs, goal)
+        action = action_dist.rsample()
+        log_prob = action_dist.log_prob(action).sum(-1)
+        logits = self.critic_fn(obs, action, goal)
+        logits = logits.min(dim=-1)[0]
+        alpha = torch.exp(self.log_alpha).detach()
+        loss = (-logits.diag() + alpha * log_prob).mean()
+        return loss
+    
+    def alpha_loss(self, obs, goal):
+        action_dist = self.policy.policy_dist(obs, goal)
+        action = action_dist.rsample()
+        log_prob = action_dist.log_prob(action).sum(-1)
+        alpha = torch.exp(self.log_alpha)
+        alpha_loss = alpha * (-log_prob - self.target_entropy).detach()
+        return (alpha_loss).mean()
     
     def train(self):
         sample, future_states = self.buffer.sample_with_goals_as_tensors(self.device, batch_size=256)
@@ -120,12 +155,15 @@ class CRLAgent:
         actor_loss.backward()
         self.policy_optim.step()
         
-        self.sa_encoder_optim.zero_grad()
-        self.g_encoder_optim.zero_grad()
+        self.critic_optim.zero_grad()
         critic_loss = self.critic_loss(obs, action, future_states)
         critic_loss.backward()
-        self.sa_encoder_optim.step()
-        self.g_encoder_optim.step()
+        self.critic_optim.step()
+        
+        self.alpha_optim.zero_grad()
+        alpha_loss = self.alpha_loss(obs, true_goals)
+        alpha_loss.backward()
+        self.alpha_optim.step()
 
         return critic_loss, actor_loss
     

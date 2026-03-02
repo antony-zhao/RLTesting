@@ -6,6 +6,8 @@ from crl import CRLAgent
 from rltesting.utils.logger import Logger
 from rltesting.utils.torch_utils import to_numpy
 
+# part of this code is written by AI (which was probably obvious by the comments), just didn't want ot have to rewrite the whole training loop for the nth time. the algorithm itself isn't
+
 def format_vector_observation(obs_dict):
     """Converts batched Gymnasium dict observations into flat [state, padded_goal] arrays."""
     s = obs_dict['observation']           # shape: (num_envs, obs_dim)
@@ -19,7 +21,7 @@ def format_vector_observation(obs_dict):
     # Concatenate along the feature dimension
     return s, g
 
-num_envs = 16
+num_envs = 32
 num_steps = 1_000_000
 initial_data = 10_000
 batch_size = 256
@@ -62,7 +64,7 @@ while total_steps < num_steps:
     # 4. Train the Agent
     # Check if buffer has enough samples (you might need to adjust based on your buffer's API)
     if total_steps > initial_data:
-        for _ in range(16):
+        for _ in range(64):
             critic_loss, actor_loss = agent.train()
         logger.add_scalar('critic_loss', to_numpy(critic_loss))
         logger.add_scalar('actor_loss', to_numpy(actor_loss))
@@ -73,4 +75,5 @@ while total_steps < num_steps:
             successes = infos['is_success']
             print(f"Steps: {total_steps} | Recent Success Rate: {np.mean(successes):.2f}")
             logger.add_scalar("success_rate", np.mean(successes))
+            
     logger.write(total_steps)

@@ -14,7 +14,7 @@ def compute_pad(kernel_size, stride):
 
 class MLP(nn.Module):
     # if hidden dims is specified then doesn't use skip connections
-    def __init__(self, input_dim, output_dim, hidden_dim=256, num_hiddens=2, act=nn.GELU, hidden_dims=None, final_act=None, skip_connections=None):
+    def __init__(self, input_dim, output_dim, hidden_dim=256, num_hiddens=2, act=nn.GELU, hidden_dims=None, final_act=None, skip_connections=False):
         super().__init__()
         if hidden_dims is not None:
             assert len(hidden_dims) + 1 == num_hiddens
