@@ -1,25 +1,25 @@
 environment:
   env_type: atari
-  env_id: Pong
+  env_id: Boxing
   image_size: 64
-  framestack: 4
+  framestack: 2
   grayscale: true
 
 data:
-  data_steps: 20000
+  data_steps: 100000
   batch_size: 256
   device: auto
 
 model:
   latent_dim: 1024
-  model_path: rltesting/fvd_experiments/models/pong.pt
+  model_path: rltesting/fvd_experiments/models/boxing.pt
 
 training:
-  train_steps: 20000
+  train_steps: 50000
   learning_rate: 3.0e-4
   penalty_coeff: 1.0e-4
 
 intrinsic_dimension:
   id_num_batches: 30
   id_batch_size: 2048
-  scale_factor: 4 # can scale the ID to give more room for learning, since we don't necessarily need the exact ID anyways
+  scale_factor: 1.0 # can scale the ID to give more room for learning, since we don't necessarily need the exact ID anyways

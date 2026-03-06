@@ -66,7 +66,7 @@ def make_env(gym_id, seed, time_limit=4500, eval=False):
             env = ClipRewardEnv(env)
         env = gym.wrappers.ResizeObservation(env, (64, 64))
         env = gym.wrappers.GrayscaleObservation(env)
-        env = gym.wrappers.FrameStackObservation(env, 4)
+        env = gym.wrappers.FrameStackObservation(env, 2)
         if not eval:
             env = gym.wrappers.TimeLimit(env, time_limit)
         env.action_space.seed(seed)
@@ -84,8 +84,8 @@ def main(args):
     
     # 1. Load AE Config and Models
     config = simple_process_config(load_config("rltesting/fvd_experiments/configs/atari/default.yaml"))
-    encoder = Encoder(4, config.latent_dim, 64, 1).to(device)
-    decoder = Decoder(encoder.conv_dim, 4, config.latent_dim, 1).to(device)
+    encoder = Encoder(config.framestack, config.latent_dim, 64, 1).to(device)
+    decoder = Decoder(encoder.conv_dim, config.framestack, config.latent_dim, 1).to(device)
     double_ae = load_or_create_model(config, encoder, decoder)
     dtypes = [np.uint8]
     buffer_shapes = [(2, 64, 64)]
@@ -197,7 +197,7 @@ def main(args):
 if __name__ == '__main__':
     from argparse import ArgumentParser
     parser = ArgumentParser()
-    parser.add_argument('--env', type=str, default='Pong') #MontezumaRevenge
+    parser.add_argument('--env', type=str, default='Boxing') #MontezumaRevenge
     parser.add_argument('--discount', type=float, default=0.99)
     parser.add_argument('--clip', type=float, default=0.1)
     parser.add_argument('--val-coef', type=float, default=0.5)
@@ -205,11 +205,11 @@ if __name__ == '__main__':
     parser.add_argument('--max-grad-norm', type=float, default=0.5)
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--rollout-length', type=int, default=128)
-    parser.add_argument('--num-envs', type=int, default=64)
-    parser.add_argument('--timesteps', type=int, default=200_000_000)
+    parser.add_argument('--num-envs', type=int, default=32)
+    parser.add_argument('--timesteps', type=int, default=50_000_000)
     parser.add_argument('--log-every', type=int, default=4)
-    parser.add_argument('--num-epochs', type=int, default=8)
-    parser.add_argument('--num-ae-steps', type=int, default=32)
+    parser.add_argument('--num-epochs', type=int, default=16)
+    parser.add_argument('--num-ae-steps', type=int, default=64)
     parser.add_argument('--num-minibatches', type=int, default=8)
     parser.add_argument('--seed', type=int, default=1)
     args = parser.parse_args()

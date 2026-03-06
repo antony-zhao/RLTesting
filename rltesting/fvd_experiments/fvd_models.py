@@ -137,7 +137,59 @@ class AEVAE(DoubleAutoEncoder):
         intrinsic = reparameterize(intrinsic_mu, intrinsic_logvar)
         reconstruction = self.double_decode(intrinsic)
         return F.mse_loss(image, reconstruction) + vae_kl(intrinsic_mu, intrinsic_logvar).sum(-1).mean() * self.penalty_coef
-        # return torch.sqrt((image - reconstruction) ** 2 + eps).mean() + vae_kl(intrinsic_mu, intrinsic_logvar).sum(-1).mean() * self.penalty_coef
+
+class HybridAEVAE(AEVAE):
+    def __init__(self, encoder, decoder, latent_dim, intrinsic_dim, num_codes=20, hidden_dim=256, penalty_coef=1e-5):
+        super().__init__(encoder, decoder, latent_dim, intrinsic_dim * 2, hidden_dim, penalty_coef)
+        self.codes = nn.Embedding(num_codes, intrinsic_dim)
+        self.dim = intrinsic_dim
+    
+    def discretize(self, latent):
+        distances = torch.sum((latent.unsqueeze(1) - self.codes.weight) ** 2, dim=-1)
+        codebook_ind = torch.argmin(distances, dim=-1)
+        
+        latent_q = self.codes(codebook_ind)
+        latent_q_straight_through = latent + (latent_q - latent).detach()
+        return latent_q_straight_through, latent_q
+        
+    
+    def double_encode(self, image):
+        latent = self.encoder(image)
+        intrinsic_mu = self.intrinsic_encoder(latent)
+        intrinsic_logvar = self.intrinsic_encoder_logvar(latent)
+        intrinsic = reparameterize(intrinsic_mu, intrinsic_logvar)
+        disc_intrinsic = intrinsic[:, self.dim:]
+        disc_intrinsic, _ = self.discretize(disc_intrinsic)
+        intrinsic[:, self.dim:] = disc_intrinsic
+        return intrinsic
+    
+    def double_decode(self, intrinsic):
+        reconstructed_latent = self.intrinsic_decoder(intrinsic)
+        reconstructed = self.decoder(reconstructed_latent)
+        return reconstructed
+    
+    def compute_intrinsic(self, latent):
+        intrinsic_mu = self.intrinsic_encoder(latent)
+        intrinsic_logvar = self.intrinsic_encoder_logvar(latent)
+        intrinsic = reparameterize(intrinsic_mu, intrinsic_logvar)
+        disc_intrinsic = intrinsic[:, self.dim:]
+        disc_intrinsic, _ = self.discretize(disc_intrinsic)
+        intrinsic[:, self.dim:] = disc_intrinsic
+        return intrinsic
+    
+    def reconstruction_loss(self, image, eps=1e-6):
+        latent = self.encoder(image)
+        intrinsic_mu = self.intrinsic_encoder(latent)
+        intrinsic_logvar = self.intrinsic_encoder_logvar(latent)
+        intrinsic = reparameterize(intrinsic_mu, intrinsic_logvar)
+        disc_intrinsic = intrinsic[:, self.dim:]
+        disc_intrinsic_straight_through, codebook = self.discretize(disc_intrinsic)
+        intrinsic[:, self.dim:] = disc_intrinsic_straight_through
+        reconstruction = self.double_decode(intrinsic)
+        codebook_loss = F.mse_loss(codebook, disc_intrinsic.detach())
+        commitment_loss = F.mse_loss(codebook.detach(), disc_intrinsic)
+        dist_loss = distance_correlation_loss(intrinsic[:, :self.dim], intrinsic[:, self.dim:])
+        return F.mse_loss(image, reconstruction) + vae_kl(intrinsic_mu, intrinsic_logvar).sum(-1).mean() * self.penalty_coef + codebook_loss + commitment_loss * 0.1 #+ dist_loss * 0.1 # TODO add info gan terms and beta-VAE
 
 def vae_kl(mu, logvar):
     return 0.5 * (-logvar - 1 + torch.exp(logvar) + mu ** 2)
@@ -146,3 +198,23 @@ def reparameterize(mu, logvar):
     eps = torch.randn_like(mu)
     z = mu * torch.exp(logvar * 0.5) + eps 
     return z
+
+def distance_correlation_loss(z, c):
+    def get_distance_matrix(x):
+        # Efficient pairwise Euclidean distance
+        x_norm = (x**2).sum(1).view(-1, 1)
+        dist = x_norm + x_norm.t() - 2 * (x @ x.t())
+        return torch.sqrt(torch.clamp(dist, min=1e-8))
+
+    def double_center(mat):
+        row_mean = mat.mean(dim=1, keepdim=True)
+        col_mean = mat.mean(dim=0, keepdim=True)
+        grand_mean = mat.mean()
+        return mat - row_mean - col_mean + grand_mean
+
+    A = double_center(get_distance_matrix(z))
+    B = double_center(get_distance_matrix(c))
+    
+    # Distance Covariance
+    dcov2 = torch.mean(A * B)
+    return dcov2 # Add this to your total loss
