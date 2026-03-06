@@ -86,7 +86,7 @@ def main(args):
     config = simple_process_config(load_config("rltesting/fvd_experiments/configs/atari/default.yaml"))
     encoder = Encoder(config.framestack, config.latent_dim, 64, 1).to(device)
     decoder = Decoder(encoder.conv_dim, config.framestack, config.latent_dim, 1).to(device)
-    double_ae = load_or_create_model(config, encoder, decoder)
+    double_ae = load_or_create_model(config, encoder, decoder, AEVAE)
     dtypes = [np.uint8]
     buffer_shapes = [(2, 64, 64)]
     buffer = ReplayBuffer(buffer_shapes, dtypes, buffer_size=1_000_000)

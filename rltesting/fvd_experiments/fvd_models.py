@@ -16,7 +16,8 @@ class EncoderConv(nn.Module):
         for i, filter in enumerate(filters):
             layers.append(nn.Conv2d(image_channels if i == 0 else filters[i - 1], filter, kernel_size, 
                                     stride=2, padding=compute_pad(kernel_size, 2), bias=i == len(filters) - 1))
-            layers.append(nn.BatchNorm2d(filter))
+            if i < len(filters) - 1:
+                layers.append(nn.BatchNorm2d(filter))
             layers.append(act())
         self.layers = nn.Sequential(*layers)
         size = input_size // (2 ** num_convs)
@@ -196,25 +197,27 @@ def vae_kl(mu, logvar):
 
 def reparameterize(mu, logvar):
     eps = torch.randn_like(mu)
-    z = mu * torch.exp(logvar * 0.5) + eps 
+    z = mu * eps + torch.exp(logvar * 0.5)
     return z
 
 def distance_correlation_loss(z, c):
+    n = z.size(0)
+    
     def get_distance_matrix(x):
-        # Efficient pairwise Euclidean distance
-        x_norm = (x**2).sum(1).view(-1, 1)
-        dist = x_norm + x_norm.t() - 2 * (x @ x.t())
-        return torch.sqrt(torch.clamp(dist, min=1e-8))
+        x_norm = (x ** 2).sum(1).view(-1, 1)
+        dist_sq = x_norm + x_norm.t() - 2 * (x @ x.t())
+        return torch.clamp(dist_sq, min=0)
 
-    def double_center(mat):
+    def u_center(mat):
         row_mean = mat.mean(dim=1, keepdim=True)
         col_mean = mat.mean(dim=0, keepdim=True)
         grand_mean = mat.mean()
-        return mat - row_mean - col_mean + grand_mean
+        centered = mat - row_mean - col_mean + grand_mean
+        centered.fill_diagonal_(0)
+        return centered
 
-    A = double_center(get_distance_matrix(z))
-    B = double_center(get_distance_matrix(c))
-    
-    # Distance Covariance
-    dcov2 = torch.mean(A * B)
-    return dcov2 # Add this to your total loss
+    A = u_center(get_distance_matrix(z))
+    B = u_center(get_distance_matrix(c))
+
+    dcov2 = torch.sum(A * B) / (n * (n - 3))
+    return dcov2
