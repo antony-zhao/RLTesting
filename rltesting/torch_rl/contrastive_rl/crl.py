@@ -5,22 +5,49 @@ from torch.nn import functional as F
 from rltesting.torch_rl.models import MLP, IMPALACNN, reparameterize_normal
 from rltesting.torch_rl.buffers import PerEnvTrajectoryBuffer
 from rltesting.torch_rl.distributions import SafeTanhNormal
+from rltesting.torch_rl.utils import to_numpy
 from torch.optim import Adam
 from torch.distributions import Normal, Categorical
 
+class ResidualBlock(nn.Module):
+    def __init__(self, hidden_dim=256, act=nn.SiLU):
+        super().__init__()
+        layers = []
+        for _ in range(4):
+            layers += [nn.Linear(hidden_dim, hidden_dim), nn.LayerNorm(hidden_dim), act()]
+        self.layers = nn.Sequential(*layers)
+    
+    def forward(self, x):
+        return self.layers(x) + x
+    
+class ScalingMLP(nn.Module):
+    def __init__(self, input_dim, output_dim, num_blocks=4, hidden_dim=256, act=nn.SiLU):
+        super().__init__()
+        self.blocks = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            act(),
+            *[ResidualBlock(hidden_dim, act) for _ in range(num_blocks)],
+            nn.Linear(hidden_dim, output_dim)
+        )
+    
+    def forward(self, x):
+        return self.blocks(x)
+        
+
 class Encoder(nn.Module):
-    def __init__(self, input_dim, output_dim=64, hidden_dim=256, depth=4, act=nn.GELU):
-        # specify input_dim as (size, size, channels)
+    def __init__(self, input_dim, output_dim=64, hidden_dim=256, depth=2, act=nn.SiLU):
+        # specify input_dim as (size, size, channels) for image
         # hidden_dim for vec encoder
         super().__init__()
         self.obs_dim = input_dim
-        self.is_image = type(input_dim) is tuple and len(input_dim) > 1
         self.output_dim = output_dim
+        self.is_image = type(input_dim) is tuple and len(input_dim) > 1
         if self.is_image:
             self.conv_enc = IMPALACNN(input_dim[-1], depth-1, input_dim[0], act=act)
             self.out = nn.Linear(self.conv_enc.output_dim, output_dim)
         else:
-            self.out = MLP(input_dim[0], output_dim, hidden_dim, num_hiddens=depth, act=act, skip_connections=True)
+            self.out = ScalingMLP(input_dim[0], output_dim, depth, hidden_dim, act=act)
             
     def forward(self, x):
         if self.is_image:
@@ -28,34 +55,45 @@ class Encoder(nn.Module):
         return self.out(x)
 
 class MultiEncoder(nn.Module):
-    def __init__(self, input_dims, depths, final_depth=2, output_dim=64, hidden_dim=256, act=nn.GELU):
+    def __init__(self, input_dims, depths, num_blocks=4, output_dim=64, hidden_dim=256, act=nn.SiLU):
         super().__init__()
         self.num = len(input_dims)
         self.encoders = nn.ModuleList(
-            [Encoder(input_dims[i], hidden_dim, hidden_dim, depths[i] - 1) for i in range(self.num)]
+            [
+                Encoder(input_dims[i], hidden_dim, depths[i] - 1, act) 
+                if type(input_dims[i]) is tuple and len(input_dims[i]) > 1 
+                else nn.Identity() for i in range(self.num)
+            ]
         )
-        self.act = act()
-        self.out = MLP(hidden_dim * self.num, output_dim, hidden_dim, final_depth)
+        temp_dim = np.sum([
+                            hidden_dim if 
+                            type(input_dims[i]) is tuple and len(input_dims[i]) > 1 else 
+                            input_dims[i] for i in range(self.num)
+                        ]
+        )
+        self.out = ScalingMLP(temp_dim, output_dim, num_blocks, hidden_dim, act)
     
     def forward(self, xs):
         xs = [self.encoders[i](xs[i]) for i in range(self.num)]
         x = torch.cat(xs, dim=-1)
-        x = self.out(self.act(x))
+        x = self.out(x)
         return x
     
 class PolicyModel(nn.Module):
-    def __init__(self, obs_dim, action_dim, action_type="continuous", hidden_dim=256, upscale=1.0):
+    def __init__(self, obs_dim, action_dim, action_type="continuous", hidden_dim=256, num_blocks=2, act=nn.SiLU, upscale=1.0):
         super().__init__()
-        self.encoder = Encoder(obs_dim, hidden_dim, hidden_dim)
-        self.goal_encoder = Encoder(obs_dim, hidden_dim, hidden_dim)
+        is_image = type(obs_dim) is tuple and len(obs_dim) > 1
+        self.encoder = Encoder(obs_dim, hidden_dim) if is_image else nn.Identity()
+        self.goal_encoder = Encoder(obs_dim, hidden_dim) if is_image else nn.Identity()
+        mlp_dim = hidden_dim * 2 if is_image else obs_dim[0] * 2
         self.action_type = action_type
         self.upscale = upscale
         
         if action_type == "continuous":
-            self.policy_mu = MLP(hidden_dim * 2, action_dim[0], skip_connections=False)
+            self.policy_mu = ScalingMLP(mlp_dim, action_dim[0], num_blocks, hidden_dim, act)
             self.policy_logstd = nn.Parameter(torch.zeros(1, action_dim[0]))
         else:
-            self.policy = MLP(hidden_dim * 2, action_dim[0], skip_connections=False)
+            self.policy = ScalingMLP(mlp_dim, action_dim[0], num_blocks, hidden_dim, act)
     
     def policy_dist(self, obs, goal=None):
         x = self.encoder(obs)
@@ -81,16 +119,18 @@ class PolicyModel(nn.Module):
 
 class CRLAgent:
     def __init__(
-        self, obs_dim, action_dim, num_envs, device, repr_dim=64, action_type="continuous", 
-        obs_encoder_depth=1, action_encoder_depth=0, multi_encoder_depth=2, buffer_size=1_000_000, alpha=0.1
+        self, obs_dim, action_dim, num_envs, device, obs_to_goal, repr_dim=64, action_type="continuous", 
+        obs_encoder_depth=3, action_encoder_depth=1, multi_encoder_depth=2, buffer_size=1_000_000, use_alpha=True
     ):
         self.device = device
+        self.obs_to_goal = obs_to_goal
+
         self.sa_encoder1 = MultiEncoder(
-            (obs_dim, action_dim), depths=(obs_encoder_depth, action_encoder_depth), output_dim=repr_dim, final_depth=multi_encoder_depth
+            (obs_dim, action_dim), depths=(obs_encoder_depth, action_encoder_depth), output_dim=repr_dim, num_blocks=multi_encoder_depth
         ).to(device)
         self.g_encoder1 = Encoder(obs_dim, output_dim=repr_dim, depth=obs_encoder_depth).to(device)
         self.sa_encoder2 = MultiEncoder(
-            (obs_dim, action_dim), depths=(obs_encoder_depth, action_encoder_depth), output_dim=repr_dim, final_depth=multi_encoder_depth
+            (obs_dim, action_dim), depths=(obs_encoder_depth, action_encoder_depth), output_dim=repr_dim, num_blocks=multi_encoder_depth
         ).to(device)
         self.g_encoder2 = Encoder(obs_dim, output_dim=repr_dim, depth=obs_encoder_depth).to(device)
         self.policy = PolicyModel(obs_dim, action_dim, action_type).to(device)
@@ -104,26 +144,37 @@ class CRLAgent:
         is_image = type(obs_dim) is tuple and len(obs_dim) > 1
         obs_type = np.float32 if not is_image else np.uint8
         dtypes = [obs_type, np.float32, np.float32, obs_type, np.bool]
-        self.target_entropy = -action_dim[0]
+        self.target_entropy = -action_dim[0] * 0.5
         self.log_alpha = nn.Parameter(torch.tensor(0.0).to(device))
         self.alpha_optim = Adam([self.log_alpha], 3e-4)
         self.buffer = PerEnvTrajectoryBuffer(num_envs, buffer_shapes, dtypes, buffer_size)
+        self.use_alpha = use_alpha
     
     def critic_fn(self, obs, action, obs_f):
         sa_repr1 = self.sa_encoder1([obs, action])
         g_repr1 = self.g_encoder1(obs_f)
-        logits1 = torch.einsum('ik, jk -> ij', sa_repr1, g_repr1)
-        sa_repr2 = self.sa_encoder2([obs, action])
-        g_repr2 = self.g_encoder2(obs_f)
-        logits2 = torch.einsum('ik, jk -> ij', sa_repr2, g_repr2)
-        return torch.stack([logits1, logits2], dim=-1)
+        # logits1 = torch.einsum('ik, jk -> ij', sa_repr1, g_repr1)
+        logits = -torch.sqrt(torch.sum((sa_repr1[:, None, :] - g_repr1[None, :, :]) ** 2, dim=-1))
+        # sa_repr2 = self.sa_encoder2([obs, action])
+        # g_repr2 = self.g_encoder2(obs_f)
+        # logits2 = torch.einsum('ik, jk -> ij', sa_repr2, g_repr2)
+        return logits #torch.stack([logits1, logits2], dim=-1)
     
     def critic_loss(self, obs, action, obs_f):
-        goal_obs = obs_f.clone()
-        goal_obs[:, 3:] = 0
-        logits = self.critic_fn(obs, action, goal_obs)
-        target = torch.eye(logits.shape[0]).to(self.device).unsqueeze(-1).expand_as(logits)
-        return F.binary_cross_entropy_with_logits(logits, target)
+        logits = self.critic_fn(obs, action, obs_f)
+        # target = torch.eye(logits.shape[0]).to(self.device).unsqueeze(-1).expand_as(logits)
+        # logits_mean = logits.mean(dim=-1)
+        logits_pos = logits.diag().mean()
+        n = logits.shape[0]
+        logits_neg = (logits.sum() - logits.diag().sum()) / (n * n - n)
+        # loss = F.binary_cross_entropy_with_logits(logits, target)
+        loss = -torch.diag(logits) + torch.logsumexp(logits, dim=1)
+        loss = loss.mean()
+        logsumexp_reg = 0.1 * torch.logsumexp(logits + 1e-6, dim=1).pow(2).mean()
+        return loss + logsumexp_reg, {
+            "logits_pos": to_numpy(logits_pos),
+            "logits_neg": to_numpy(logits_neg)
+        }
     
     def actor_loss(self, obs, goal):
         obs = torch.cat([obs, obs], dim=0)
@@ -133,10 +184,13 @@ class CRLAgent:
         action = action_dist.rsample()
         log_prob = action_dist.log_prob(action).sum(-1)
         logits = self.critic_fn(obs, action, goal)
-        logits = logits.min(dim=-1)[0]
+        # logits = logits.min(dim=-1)[0]
         alpha = torch.exp(self.log_alpha).detach()
-        loss = (-logits.diag() + alpha * log_prob).mean()
-        return loss
+        if self.use_alpha:
+            loss = (-logits.diag() + alpha * log_prob).mean()
+        else:
+            loss = -logits.diag().mean()
+        return loss, {"alpha": to_numpy(alpha)}
     
     def alpha_loss(self, obs, goal):
         action_dist = self.policy.policy_dist(obs, goal)
@@ -147,25 +201,29 @@ class CRLAgent:
         return (alpha_loss).mean()
     
     def train(self):
-        sample, future_states = self.buffer.sample_with_goals_as_tensors(self.device, batch_size=256)
+        sample, future_states, traj_ids = self.buffer.sample_with_goals_as_tensors(self.device, batch_size=256)
         obs, action, reward, true_goals, done = sample
+        obs_goal = to_numpy(future_states)
+        obs_goal = self.obs_to_goal(obs_goal)
+        obs_goal = torch.as_tensor(obs_goal).to(self.device)
         
         self.policy_optim.zero_grad()
-        actor_loss = self.actor_loss(obs, true_goals)
+        actor_loss, actor_metrics = self.actor_loss(obs, obs_goal)
         actor_loss.backward()
         self.policy_optim.step()
         
         self.critic_optim.zero_grad()
-        critic_loss = self.critic_loss(obs, action, future_states)
+        critic_loss, critic_metrics = self.critic_loss(obs, action, obs_goal)
         critic_loss.backward()
         self.critic_optim.step()
         
-        self.alpha_optim.zero_grad()
-        alpha_loss = self.alpha_loss(obs, true_goals)
-        alpha_loss.backward()
-        self.alpha_optim.step()
+        if self.use_alpha:
+            self.alpha_optim.zero_grad()
+            alpha_loss = self.alpha_loss(obs, obs_goal)
+            alpha_loss.backward()
+            self.alpha_optim.step()
 
-        return critic_loss, actor_loss
+        return critic_loss, actor_loss, actor_metrics | critic_metrics
     
     def act(self, obs, goal=None):
         return self.policy(obs, goal)

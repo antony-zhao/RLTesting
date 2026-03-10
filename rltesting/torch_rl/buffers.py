@@ -197,7 +197,8 @@ class TrajectoryReplayBuffer(ReplayBuffer):
         indices = self.sample_indices(batch_size, seq_len)
         data = self.sample(indices=indices)
         goals = self.sample_goals(indices, discount)
-        return data, goals
+        traj_ids = self.indices[indices, 0]
+        return data, goals, traj_ids
 
     def get_state(self):
         state = super().get_state()
@@ -294,28 +295,28 @@ class PerEnvTrajectoryBuffer(PerEnvBuffer):
     def sample_with_goals(self, batch_size, seq_len=1, discount=0.99):
         per_env_batch = np.bincount(np.random.randint(0, self.num_envs, batch_size), minlength=self.num_envs)
         
-        per_env_samples = []
-        per_env_goals = []
+        per_env_samples, per_env_goals, per_env_traj_ids = [], [], []
         for i, env_batch_size in enumerate(per_env_batch):
             if env_batch_size > 0:
-                data, goal = self.buffers[i].sample_with_goals(env_batch_size, seq_len, discount)
+                data, goal, traj_ids = self.buffers[i].sample_with_goals(env_batch_size, seq_len, discount)
                 per_env_samples.append(data)
                 per_env_goals.append(goal)
+                
+                global_ids = np.stack([np.full(env_batch_size, i), traj_ids], axis=1)
+                per_env_traj_ids.append(global_ids)
         
-        # Determine how many items the sub-buffer actually returned 
-        # (e.g., states, actions, rewards, next_states, AND goals)
+        # determine how many items the sub-buffer actually returned 
         num_returned_items = len(per_env_samples[0])
         
-        samples = []
-        for i in range(num_returned_items):
-            samples.append(np.concatenate([sample[i] for sample in per_env_samples], axis=0 if seq_len == 1 else 1))
+        samples = [np.concatenate([s[i] for s in per_env_samples], axis=0) for i in range(num_returned_items)]
         goals = np.concatenate(per_env_goals, axis=0)
-        
-        return samples, goals
+        traj_ids = np.concatenate(per_env_traj_ids, axis=0)
+        return samples, goals, traj_ids
 
     def sample_with_goals_as_tensors(self, device, batch_size, seq_len=1, discount=0.99):
-        samples, goals = self.sample_with_goals(batch_size, seq_len, discount)
+        samples, goals, traj_ids = self.sample_with_goals(batch_size, seq_len, discount)
         samples_tensors = [torch.tensor(sample).to(device).float() for sample in samples]
         goals_tensor = torch.tensor(goals).to(device).float()
-        return samples_tensors, goals_tensor
+        traj_ids = torch.tensor(traj_ids).to(device)
+        return samples_tensors, goals_tensor, traj_ids
     
