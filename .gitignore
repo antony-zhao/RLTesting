@@ -183,3 +183,4 @@ ImageNet100
 *.ckpt
 *.pt
 *temp.py
+*.npz
