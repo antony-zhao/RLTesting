@@ -32,3 +32,20 @@ def get_obs_shape(
     elif isinstance(observation_space, spaces.Discrete):
         # Observation is an int
         return (1,)
+
+class EarlyStopping:
+    def __init__(self, patience=5, delta=0):
+        self.patience = patience
+        self.delta = delta
+        self.lowest_loss = None
+        self.counter = 0
+
+    def __call__(self, loss):
+        if self.lowest_loss is None or bool(loss < self.lowest_loss + self.delta):
+            self.lowest_loss = loss
+            self.counter = 0
+        else:
+            self.counter += 1
+            if self.counter >= self.patience:
+                return True
+        return False

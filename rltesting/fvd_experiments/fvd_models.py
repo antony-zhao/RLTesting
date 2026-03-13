@@ -90,7 +90,7 @@ class DoubleAutoEncoder(nn.Module):
         return reconstructed
     
     def compute_latent(self, image):
-        return self.encoder(image).detach()
+        return self.encoder(image)
     
     def compute_intrinsic(self, latent):
         return self.intrinsic_encoder(latent)
@@ -101,23 +101,26 @@ class DoubleAutoEncoder(nn.Module):
     def reconstruct_image(self, latent):
         return self.decoder(latent)
     
-    def reconstruction_loss(self, image, eps=1e-6):
-        int_ = self.double_encode(image)
-        reconstruction = self.double_decode(int_)
-        return F.mse_loss(image, reconstruction) #torch.sqrt((image - reconstruction) ** 2 + eps).mean() #
+    def reconstruction_loss(self, image):
+        latent = self.compute_latent(image)
+        intrinsic = self.compute_intrinsic(latent.detach())
+        latent_reconstruction = self.reconstruct_latent(intrinsic)
+        reconstruction = self.reconstruct_image(latent)
+        return F.mse_loss(image, reconstruction) + F.mse_loss(latent.detach(), latent_reconstruction)
 
 class AEVAE(DoubleAutoEncoder):
     def __init__(self, encoder, decoder, latent_dim, intrinsic_dim, hidden_dim=256, penalty_coef=1e-5):
         super().__init__(encoder, decoder, latent_dim, intrinsic_dim, hidden_dim)
         # treat intrinsic_encoder as producing the mean
         self.penalty_coef = penalty_coef
-        self.intrinsic_encoder_logvar = MLP(latent_dim, intrinsic_dim, hidden_dim, act=nn.GELU, skip_connections=False)
+        self.intrinsic_encoder = MLP(latent_dim, latent_dim, hidden_dim, act=nn.GELU, skip_connections=False)
+        self.intrinsic_decoder = MLP(intrinsic_dim, latent_dim, hidden_dim, act=nn.GELU, skip_connections=False)
+        self.intrinsic_mu = nn.Linear(latent_dim, intrinsic_dim)
+        self.intrinsic_logvar = nn.Linear(latent_dim, intrinsic_dim)
     
     def double_encode(self, image):
         latent = self.encoder(image)
-        intrinsic_mu = self.intrinsic_encoder(latent)
-        intrinsic_logvar = self.intrinsic_encoder_logvar(latent)
-        intrinsic = reparameterize(intrinsic_mu, intrinsic_logvar)
+        intrinsic = self.compute_intrinsic(latent)
         return intrinsic
     
     def double_decode(self, intrinsic):
@@ -126,18 +129,21 @@ class AEVAE(DoubleAutoEncoder):
         return reconstructed
     
     def compute_intrinsic(self, latent):
-        intrinsic_mu = self.intrinsic_encoder(latent)
-        intrinsic_logvar = self.intrinsic_encoder_logvar(latent)
+        temp = self.intrinsic_encoder(latent)
+        intrinsic_mu = self.intrinsic_mu(temp)
+        intrinsic_logvar = self.intrinsic_logvar(temp)
         intrinsic = reparameterize(intrinsic_mu, intrinsic_logvar)
         return intrinsic
     
-    def reconstruction_loss(self, image, eps=1e-6):
+    def reconstruction_loss(self, image):
         latent = self.encoder(image)
-        intrinsic_mu = self.intrinsic_encoder(latent)
-        intrinsic_logvar = self.intrinsic_encoder_logvar(latent)
+        temp = self.intrinsic_encoder(latent.detach())
+        intrinsic_mu = self.intrinsic_mu(temp)
+        intrinsic_logvar = self.intrinsic_logvar(temp)
         intrinsic = reparameterize(intrinsic_mu, intrinsic_logvar)
-        reconstruction = self.double_decode(intrinsic)
-        return F.mse_loss(image, reconstruction) + vae_kl(intrinsic_mu, intrinsic_logvar).sum(-1).mean() * self.penalty_coef
+        reconstructed_latent = self.reconstruct_latent(intrinsic)
+        reconstruction = self.reconstruct_image(latent)
+        return F.mse_loss(image, reconstruction) + F.mse_loss(latent.detach(), reconstructed_latent) + vae_kl(intrinsic_mu, intrinsic_logvar).sum(-1).mean() * self.penalty_coef
 
 class HybridAEVAE(AEVAE):
     def __init__(self, encoder, decoder, latent_dim, intrinsic_dim, num_codes=20, hidden_dim=256, penalty_coef=1e-5):
@@ -157,7 +163,7 @@ class HybridAEVAE(AEVAE):
     def double_encode(self, image):
         latent = self.encoder(image)
         intrinsic_mu = self.intrinsic_encoder(latent)
-        intrinsic_logvar = self.intrinsic_encoder_logvar(latent)
+        intrinsic_logvar = self.intrinsic_logvar(latent)
         intrinsic = reparameterize(intrinsic_mu, intrinsic_logvar)
         disc_intrinsic = intrinsic[:, self.dim:]
         disc_intrinsic, _ = self.discretize(disc_intrinsic)
@@ -171,7 +177,7 @@ class HybridAEVAE(AEVAE):
     
     def compute_intrinsic(self, latent):
         intrinsic_mu = self.intrinsic_encoder(latent)
-        intrinsic_logvar = self.intrinsic_encoder_logvar(latent)
+        intrinsic_logvar = self.intrinsic_logvar(latent)
         intrinsic = reparameterize(intrinsic_mu, intrinsic_logvar)
         disc_intrinsic = intrinsic[:, self.dim:]
         disc_intrinsic, _ = self.discretize(disc_intrinsic)
@@ -181,7 +187,7 @@ class HybridAEVAE(AEVAE):
     def reconstruction_loss(self, image, eps=1e-6):
         latent = self.encoder(image)
         intrinsic_mu = self.intrinsic_encoder(latent)
-        intrinsic_logvar = self.intrinsic_encoder_logvar(latent)
+        intrinsic_logvar = self.intrinsic_logvar(latent)
         intrinsic = reparameterize(intrinsic_mu, intrinsic_logvar)
         disc_intrinsic = intrinsic[:, self.dim:]
         disc_intrinsic_straight_through, codebook = self.discretize(disc_intrinsic)
@@ -197,7 +203,7 @@ def vae_kl(mu, logvar):
 
 def reparameterize(mu, logvar):
     eps = torch.randn_like(mu)
-    z = mu * eps + torch.exp(logvar * 0.5)
+    z = mu + eps * torch.exp(logvar * 0.5)
     return z
 
 def distance_correlation_loss(z, c):
