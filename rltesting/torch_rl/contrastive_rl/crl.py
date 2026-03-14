@@ -113,7 +113,10 @@ class PolicyModel(nn.Module):
             
     def forward(self, obs, goal=None):
         dist = self.policy_dist(obs, goal)
-        action = dist.rsample()
+        if self.action_type == "continuous":
+            action = dist.rsample()
+        else:
+            action = dist.sample()
         return action
         
 
@@ -122,8 +125,9 @@ class CRLAgent:
         self, obs_dim, action_dim, num_envs, device, obs_to_goal, repr_dim=64, action_type="continuous", 
         obs_encoder_depth=1, action_encoder_depth=1, depth=2, buffer_size=1_000_000, use_alpha=True, penalty=0.1, batch_size=256
     ):
-        self.device = device
-        self.obs_to_goal = obs_to_goal
+        self.device, self.obs_to_goal, self.use_alpha, self.penalty, self.batch_size, self.action_type, self.num_actions = (
+            device, obs_to_goal, use_alpha, penalty, batch_size, action_type, action_dim[0]
+        )
 
         self.sa_encoder = MultiEncoder(
             (obs_dim, action_dim), depths=(obs_encoder_depth, action_encoder_depth), output_dim=repr_dim, num_blocks=depth
@@ -139,13 +143,10 @@ class CRLAgent:
         is_image = type(obs_dim) is tuple and len(obs_dim) > 1
         obs_type = np.float32 if not is_image else np.uint8
         dtypes = [obs_type, np.float32, np.float32, obs_type, np.bool]
-        self.target_entropy = -action_dim[0] * 0.5
+        self.target_entropy = -action_dim[0] * 0.5 if action_type == "continuous" else np.log(action_dim[0])
         self.log_alpha = nn.Parameter(torch.tensor(0.0).to(device))
         self.alpha_optim = Adam([self.log_alpha], 3e-4)
-        self.buffer = PerEnvTrajectoryBuffer(num_envs, buffer_shapes, dtypes, buffer_size)
-        self.use_alpha = use_alpha
-        self.penalty = penalty
-        self.batch_size = batch_size
+        self.buffer = PerEnvTrajectoryBuffer(num_envs, buffer_size=buffer_size)
     
     def critic_fn(self, obs, action, obs_f):
         sa_repr = self.sa_encoder([obs, action])
@@ -170,23 +171,45 @@ class CRLAgent:
         obs = torch.cat([obs, obs], dim=0)
         random_goals = torch.roll(goal, shifts=1, dims=0)
         goal = torch.cat([goal, random_goals], dim=0)
+        B = obs.shape[0]
+        
         action_dist = self.policy.policy_dist(obs, goal)
-        action = action_dist.rsample()
-        log_prob = action_dist.log_prob(action).sum(-1)
-        sa_repr = self.sa_encoder([obs, action])
-        g_repr = self.g_encoder(goal).detach()
-        logits = -torch.sqrt(torch.sum((sa_repr - g_repr) ** 2, dim=-1))
         alpha = torch.exp(self.log_alpha).detach()
-        if self.use_alpha:
-            loss = (-logits + alpha * log_prob).mean()
+        g_repr = self.g_encoder(goal).detach()
+        
+        if self.action_type == "continuous":
+            action = action_dist.rsample()
+            log_prob = action_dist.log_prob(action).sum(-1)
+            sa_repr = self.sa_encoder([obs, action])
+            logits = -torch.sqrt(torch.sum((sa_repr - g_repr) ** 2, dim=-1))
+            if self.use_alpha:
+                loss = (-logits + alpha * log_prob).mean()
+            else:
+                loss = -logits.mean()
         else:
-            loss = -logits.mean()
+            probs = action_dist.probs
+            log_probs = action_dist.logits
+            obs_expanded = obs.repeat_interleave(self.num_actions, dim=0)
+            one_hots = torch.eye(self.num_actions, device=obs.device).repeat(B, 1)
+
+            sa_reprs = self.sa_encoder([obs_expanded, one_hots])
+            sa_reprs = sa_reprs.view(B, self.num_actions, -1)
+            q_values = -torch.sqrt(torch.sum((sa_reprs - g_repr[:, None, :]) ** 2, dim=-1)).detach()
+            if self.use_alpha:
+                alpha = torch.exp(self.log_alpha).detach()
+                loss = (probs * (alpha * log_probs - q_values)).sum(-1).mean()
+            else:
+                loss = (probs * -q_values).sum(-1).mean()
+                
         return loss, {"alpha": to_numpy(alpha)}
     
     def alpha_loss(self, obs, goal):
         action_dist = self.policy.policy_dist(obs, goal)
-        action = action_dist.rsample()
-        log_prob = action_dist.log_prob(action).sum(-1)
+        if self.action_type == "continuous":
+            action = action_dist.rsample()
+            log_prob = action_dist.log_prob(action).sum(-1)
+        else:
+            log_prob = (action_dist.probs * action_dist.logits).sum(-1)
         alpha = torch.exp(self.log_alpha)
         alpha_loss = alpha * (-log_prob - self.target_entropy).detach()
         return (alpha_loss).mean()
@@ -194,6 +217,8 @@ class CRLAgent:
     def train(self):
         sample, future_states, traj_ids = self.buffer.sample_with_goals_as_tensors(self.device, batch_size=self.batch_size)
         obs, action, reward, true_goals, done = sample
+        if self.action_type == "discrete":
+            action = F.one_hot(action.long(), self.num_actions)
         obs_goal = to_numpy(future_states)
         obs_goal = self.obs_to_goal(obs_goal)
         obs_goal = torch.as_tensor(obs_goal).to(self.device)

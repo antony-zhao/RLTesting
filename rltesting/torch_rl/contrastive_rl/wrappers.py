@@ -194,6 +194,32 @@ class CRLFetchVecWrapper(VectorWrapper):
         return g
 
 
+class DiscretePointMazeWrapper(gym.ActionWrapper):
+    """Maps discrete actions to 2D force directions for PointMaze.
+    
+    8 actions: ±x, ±y, and 4 diagonals. 
+    """
+    ACTIONS = np.array([
+        [ 1,  0],  # +x
+        [-1,  0],  # -x
+        [ 0,  1],  # +y
+        [ 0, -1],  # -y
+        [ 1,  1],  # +x +y
+        [ 1, -1],  # +x -y
+        [-1,  1],  # -x +y
+        [-1, -1],  # -x -y
+    ], dtype=np.float32)
+
+    def __init__(self, env, delta=1.0):
+        super().__init__(env)
+        self.action_space = gym.spaces.Discrete(8)
+        self._actions = self.ACTIONS * delta
+        self._actions[4:] *= np.sqrt(0.5)  # normalize diagonals
+
+    def action(self, act):
+        return self._actions[act]
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  Convenience Constructors
 # ══════════════════════════════════════════════════════════════════════════════
@@ -263,3 +289,29 @@ def make_fetch_push(num_envs=None, dense=True, **kwargs):
     else:
         env = gym.make(env_id, **kwargs)
         return CRLFetchWrapper(env, start_index=3, end_index=6, goal_indices=goal_indices)
+    
+def make_point_maze(num_envs=None, maze='UMaze', dense=True, discrete=False, delta=0.5, **kwargs):
+    """Create a CRL-wrapped PointMaze environment.
+
+    PointMaze: obs(4) = [x, y, vx, vy], achieved_goal = obs[0:2] (position).
+    Goal vector: desired_goal placed at indices [0, 1].
+    """
+    import gymnasium_robotics
+    gym.register_envs(gymnasium_robotics)
+
+    dense_str = 'Dense' if dense else ''
+    env_id = f'PointMaze_{maze}{dense_str}-v3'
+
+    if num_envs is not None:
+        def _make_env():
+            env = gym.make(env_id, **kwargs)
+            if discrete:
+                env = DiscretePointMazeWrapper(env, delta=delta)
+            return env
+        vec_env = SyncVectorEnv([_make_env for _ in range(num_envs)])
+        return CRLFetchVecWrapper(vec_env, start_index=0, end_index=2)
+    else:
+        env = gym.make(env_id, **kwargs)
+        if discrete:
+            env = DiscretePointMazeWrapper(env, delta=delta)
+        return CRLFetchWrapper(env, start_index=0, end_index=2)
