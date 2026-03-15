@@ -78,8 +78,6 @@ def pretrain(config, encoder, decoder, reconstruction_loss, intrinsic_autoencode
         loss.backward()
         int_opt.step()
         int_opt.zero_grad()
-        # opt.step()
-        # opt.zero_grad()
         losses.append(loss.detach().cpu().numpy())
     
     torch.save(double_autoencoder, config.model_path)

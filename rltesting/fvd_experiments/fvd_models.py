@@ -122,6 +122,12 @@ class AEVAE(DoubleAutoEncoder):
         latent = self.encoder(image)
         intrinsic = self.compute_intrinsic(latent)
         return intrinsic
+
+    def double_encode_deterministic(self, image):
+        latent = self.encoder(image)
+        temp = self.intrinsic_encoder(latent)
+        intrinsic_mu = self.intrinsic_mu(temp)
+        return intrinsic_mu
     
     def double_decode(self, intrinsic):
         reconstructed_latent = self.intrinsic_decoder(intrinsic)

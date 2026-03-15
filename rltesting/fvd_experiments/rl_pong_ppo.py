@@ -117,7 +117,7 @@ def main(args):
         for t in range(args.rollout_length):
             obs_t = (torch.as_tensor(obs).float() / 255.0).to(device)
             with torch.no_grad():
-                latents = double_ae.double_encode(obs_t)
+                latents = double_ae.double_encode_deterministic(obs_t)
                 action, log_prob = ppo_net.policy_network.policy_fn(latents)
                 val = ppo_net.value_network(latents)
             
@@ -134,14 +134,14 @@ def main(args):
                 if num_completed > 0:
                     logger.add_scalar("ep_rew", total_reward)
                     logger.write((i * args.rollout_length + t) * args.num_envs)
-            # for j in range(args.num_envs):
-            #     buffer.add_sample([obs[j]])
+            for j in range(args.num_envs):
+                buffer.add_sample([obs[j]])
 
         # --- Advantages ---
         rollout.last_obs = obs
         with torch.no_grad():
             last_obs_t = (torch.as_tensor(obs).float() / 255.0).to(device)
-            last_val = to_numpy(ppo_net.value_network(double_ae.double_encode(last_obs_t))).flatten()
+            last_val = to_numpy(ppo_net.value_network(double_ae.double_encode_deterministic(last_obs_t))).flatten()
         
         mb_values.append(last_val)
         r_obs, r_actions, r_rewards, r_dones, r_logprobs, _ = rollout.unpack()
@@ -157,13 +157,6 @@ def main(args):
         # --- Training ---
         indices = np.arange(len(b_obs))
         for epoch in range(args.num_epochs):
-            # for _ in range(args.num_ae_steps):
-                # # Update AE
-                # obs_sample = torch.tensor(buffer.sample(256)[0]).to(device) / 255.0
-                # ae_loss = double_ae.reconstruction_loss(obs_sample)
-                # ae_opt.zero_grad()
-                # ae_loss.backward()
-                # ae_opt.step()
             np.random.shuffle(indices)
             for start in range(0, len(b_obs), len(b_obs)//args.num_minibatches):
                 idx = indices[start:start + len(b_obs)//args.num_minibatches]
@@ -176,7 +169,7 @@ def main(args):
                 ae_opt.step()
 
                 # Update PPO
-                curr_latents = double_ae.double_encode(t_obs).detach()
+                curr_latents = double_ae.double_encode_deterministic(t_obs).detach()
                 loss, metrics = compute_ppo_loss(
                     ppo_net, curr_latents, torch.as_tensor(b_actions[idx]).to(device)[:, None], 
                     torch.as_tensor(b_logprobs[idx]).to(device), torch.as_tensor(b_rets[idx]).to(device), 
@@ -190,6 +183,14 @@ def main(args):
 
         rollout.reset()
         anneal_lr(ppo_opt, args.lr, i, total_updates)
+        
+        for _ in range(args.num_ae_steps):
+            # Update AE
+            obs_sample = torch.tensor(buffer.sample(256)[0]).to(device) / 255.0
+            ae_loss = double_ae.reconstruction_loss(obs_sample)
+            ae_opt.zero_grad()
+            ae_loss.backward()
+            ae_opt.step()
         
         if i % 10 == 0:
             print(f"Update {i}/{total_updates} | AE Loss: {ae_loss.item():.4f}")
@@ -209,7 +210,7 @@ if __name__ == '__main__':
     parser.add_argument('--timesteps', type=int, default=50_000_000)
     parser.add_argument('--log-every', type=int, default=4)
     parser.add_argument('--num-epochs', type=int, default=16)
-    parser.add_argument('--num-ae-steps', type=int, default=64)
+    parser.add_argument('--num-ae-steps', type=int, default=128)
     parser.add_argument('--num-minibatches', type=int, default=8)
     parser.add_argument('--seed', type=int, default=1)
     args = parser.parse_args()
