@@ -122,28 +122,26 @@ class PolicyModel(nn.Module):
 
 class CRLAgent:
     def __init__(
-        self, obs_dim, action_dim, num_envs, device, obs_to_goal, repr_dim=64, action_type="continuous", 
-        obs_encoder_depth=1, action_encoder_depth=1, depth=2, buffer_size=1_000_000, use_alpha=True, penalty=0.1, batch_size=256
+        self, obs_dim, action_dim, num_envs, device, obs_to_goal, repr_dim=64, action_type="continuous", hidden_dim=64, batch_size=256,
+        obs_encoder_depth=1, action_encoder_depth=1, depth=2, buffer_size=1_000_000, use_alpha=True, penalty=0.1
     ):
         self.device, self.obs_to_goal, self.use_alpha, self.penalty, self.batch_size, self.action_type, self.num_actions = (
             device, obs_to_goal, use_alpha, penalty, batch_size, action_type, action_dim[0]
         )
 
         self.sa_encoder = MultiEncoder(
-            (obs_dim, action_dim), depths=(obs_encoder_depth, action_encoder_depth), output_dim=repr_dim, num_blocks=depth
+            (obs_dim, action_dim), depths=(obs_encoder_depth, action_encoder_depth), output_dim=repr_dim, num_blocks=depth, hidden_dim=hidden_dim
         ).to(device)
-        self.g_encoder = Encoder(obs_dim, output_dim=repr_dim, depth=depth).to(device)
-        self.policy = PolicyModel(obs_dim, action_dim, action_type, num_blocks=depth).to(device)
+        self.g_encoder = Encoder(obs_dim, output_dim=repr_dim, depth=depth, hidden_dim=hidden_dim).to(device)
+        self.policy = PolicyModel(obs_dim, action_dim, action_type, num_blocks=depth, hidden_dim=hidden_dim).to(device)
         self.critic_optim = Adam(
             list(self.sa_encoder.parameters()) + list(self.g_encoder.parameters()), 
             3e-4
         )
         self.policy_optim = Adam(self.policy.parameters(), 3e-4)
-        buffer_shapes = [obs_dim, action_dim, (1, ), obs_dim, (1, )]
         is_image = type(obs_dim) is tuple and len(obs_dim) > 1
         obs_type = np.float32 if not is_image else np.uint8
-        dtypes = [obs_type, np.float32, np.float32, obs_type, np.bool]
-        self.target_entropy = -action_dim[0] * 0.5 if action_type == "continuous" else np.log(action_dim[0])
+        self.target_entropy = -action_dim[0] * 0.5 if action_type == "continuous" else 0.3 * np.log(action_dim[0])
         self.log_alpha = nn.Parameter(torch.tensor(0.0).to(device))
         self.alpha_optim = Adam([self.log_alpha], 3e-4)
         self.buffer = PerEnvTrajectoryBuffer(num_envs, buffer_size=buffer_size)
@@ -201,7 +199,7 @@ class CRLAgent:
             else:
                 loss = (probs * -q_values).sum(-1).mean()
                 
-        return loss, {"alpha": to_numpy(alpha)}
+        return loss, {"alpha": to_numpy(alpha), "entropy": to_numpy(action_dist.entropy().mean())}
     
     def alpha_loss(self, obs, goal):
         action_dist = self.policy.policy_dist(obs, goal)

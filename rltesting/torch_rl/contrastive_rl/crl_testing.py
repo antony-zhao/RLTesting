@@ -1,4 +1,5 @@
-from wrappers import make_fetch_push, make_fetch_reach, make_fetch_reach_discrete, make_point_maze
+from fetch_wrappers import make_fetch_push, make_fetch_reach, make_fetch_reach_discrete, make_point_maze
+from minigrid_wrappers import make_minigrid
 import gymnasium as gym
 import numpy as np
 import torch
@@ -20,13 +21,16 @@ eval_interval = 4 * log_interval
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # env = make_fetch_reach(num_envs)          # continuous, obs_dim=10, act_dim=4
-# env = make_fetch_reach_discrete(num_envs) # discrete,  obs_dim=10, num_actions=6
 # env = make_fetch_push(num_envs)             # continuous, obs_dim=25, act_dim=4
+# env = make_fetch_reach_discrete(num_envs) # discrete,  obs_dim=10, num_actions=6
+env = make_minigrid(num_envs=num_envs, max_steps=episode_length)
 # env = make_fetch_reach_discrete(num_envs, delta=0.1, max_episode_steps=episode_length)
-env = make_point_maze(num_envs, maze="Medium_Diverse_GR", max_episode_steps=episode_length)
+# env = make_point_maze(num_envs, maze="Medium_Diverse_G", max_episode_steps=episode_length)
+# eval_env = make_fetch_reach(num_eval_envs)
 # eval_env = make_fetch_push(num_eval_envs)
+eval_env = make_minigrid(num_envs=num_eval_envs, max_steps=episode_length)
 # eval_env = make_fetch_reach_discrete(num_eval_envs, max_episode_steps=episode_length) 
-eval_env = make_point_maze(num_eval_envs, maze="Medium_Diverse_GR", max_episode_steps=episode_length)
+# eval_env = make_point_maze(num_eval_envs, maze="Medium_Diverse_G", max_episode_steps=episode_length)
 
 obs_dim = (env.single_observation_space.shape[0] // 2,)
 
@@ -39,7 +43,7 @@ else:
 
 agent = CRLAgent(obs_dim, (action_dim, ), num_envs, device, env.obs_to_goal, action_type=action_type)
 
-def evaluate(agent, eval_env, num_episodes=32, max_steps=episode_length, threshold=0.05):
+def evaluate(agent, eval_env, num_episodes=32, max_steps=5 * episode_length, threshold=0.05):
     (obs, goal), _ = eval_env.reset()
     n = eval_env.num_envs
     start_idx = eval_env.start_index
@@ -88,6 +92,9 @@ def evaluate(agent, eval_env, num_episodes=32, max_steps=episode_length, thresho
 total_steps = 0
 logger = Logger('logs/crl')
 
+# Cumulative success tracking between log intervals
+recent_successes = []
+
 while total_steps < num_steps:
     with torch.no_grad():
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device)
@@ -99,6 +106,11 @@ while total_steps < num_steps:
     dones = terminations | truncations
 
     agent.store_sample(obs, actions, rewards, goal, dones)
+
+    # Track successes from terminated episodes
+    if dones.any():
+        for i in np.where(dones)[0]:
+            recent_successes.append(bool(terminations[i]))
 
     obs = next_obs
     goal = next_goal
@@ -112,10 +124,11 @@ while total_steps < num_steps:
         logger.add_metrics(metrics)
 
     if total_steps % log_interval == 0:
-        if 'success' in infos:
-            success_rate = np.mean(infos['success'])
-            print(f"Steps: {total_steps:>8d} | Success: {success_rate:.2f}")
+        if recent_successes:
+            success_rate = np.mean(recent_successes)
+            print(f"Steps: {total_steps:>8d} | Success: {success_rate:.2f} ({len(recent_successes)} episodes)")
             logger.add_scalar('success_rate', success_rate)
+            recent_successes = []
 
     if total_steps % eval_interval == 0 and total_steps > initial_data:
         eval_success, eval_steps = evaluate(agent, eval_env)
