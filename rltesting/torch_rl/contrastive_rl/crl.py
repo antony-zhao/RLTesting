@@ -123,7 +123,7 @@ class PolicyModel(nn.Module):
 class CRLAgent:
     def __init__(
         self, obs_dim, action_dim, num_envs, device, obs_to_goal, repr_dim=64, action_type="continuous", hidden_dim=64, batch_size=256,
-        obs_encoder_depth=1, action_encoder_depth=1, depth=2, buffer_size=1_000_000, use_alpha=True, penalty=0.1
+        obs_encoder_depth=1, action_encoder_depth=1, depth=1, buffer_size=1_000_000, use_alpha=True, penalty=0.1
     ):
         self.device, self.obs_to_goal, self.use_alpha, self.penalty, self.batch_size, self.action_type, self.num_actions = (
             device, obs_to_goal, use_alpha, penalty, batch_size, action_type, action_dim[0]

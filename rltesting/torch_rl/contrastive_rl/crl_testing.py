@@ -66,7 +66,7 @@ def evaluate(agent, eval_env, num_episodes=32, max_steps=5 * episode_length, thr
                 action = torch.tanh(mu).cpu().numpy()
             else:
                 dist = agent.policy.policy_dist(obs_t, goal_t)
-                action = dist.probs.argmax(dim=-1).cpu().numpy()
+                action = dist.sample()#.probs.argmax(dim=-1).cpu().numpy()
 
         (obs, goal), rewards, terminations, truncations, infos = eval_env.step(action)
         steps += 1
