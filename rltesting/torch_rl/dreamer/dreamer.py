@@ -11,7 +11,8 @@ from functools import partial
 from torch.distributions import OneHotCategoricalStraightThrough, Independent, Categorical, Normal, kl_divergence, Bernoulli
 from torch.distributions.utils import probs_to_logits
 
-make_state = lambda latent, hidden: torch.cat([latent.flatten(-2), hidden], -1)
+def make_state(latent, hidden):
+    return torch.cat([latent.flatten(-2), hidden], -1)
 
 class DreamerEncoder(nn.Module):
     # if obs_type isn't image then input_dim should be specified
@@ -156,8 +157,8 @@ class DreamerWorldModel(nn.Module):
     
     def _get_hidden(self, batch_size):
         return torch.tanh(self.initial_hidden.expand(batch_size, -1))
-    
-    def recurrent_step (self, hidden, latent, action):
+        
+    def recurrent_step(self, hidden, latent, action):
         if self.config.action_type == "discrete":
             action = F.one_hot(action, self.config.action_dim).float()
         next_hidden = self.rssm(latent.flatten(-2), hidden, action)
@@ -413,7 +414,8 @@ class DreamerV3:
     def checkpoint_models(self, folderpath, filename):
         torch.save(self.world_model.state_dict(), f"{folderpath}/world_model-{filename}.pth")
         torch.save(self.actor.state_dict(), f"{folderpath}/actor-{filename}.pth")
-        torch.save(self.actor.state_dict(), f"{folderpath}/critic-{filename}.pth")
+        torch.save(self.critic.state_dict(), f"{folderpath}/critic-{filename}.pth")
+        self.buffer.save(f"{folderpath}/buffer_{filename}.npz")
     
     def init_models(self):
         self.critic.apply(init_weights)

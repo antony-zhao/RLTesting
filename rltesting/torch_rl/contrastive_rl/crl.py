@@ -34,7 +34,6 @@ class ScalingMLP(nn.Module):
     def forward(self, x):
         return self.blocks(x)
         
-
 class  Encoder(nn.Module):
     def __init__(self, input_dim, output_dim=64, hidden_dim=256, depth=2, act=nn.SiLU):
         # specify input_dim as (size, size, channels) for image
@@ -213,7 +212,7 @@ class CRLAgent:
         return (alpha_loss).mean()
     
     def train(self):
-        sample, future_states, traj_ids = self.buffer.sample_with_goals_as_tensors(self.device, batch_size=self.batch_size)
+        sample, future_states, _ = self.buffer.sample_with_goals_as_tensors(self.device, batch_size=self.batch_size)
         obs, action, reward, true_goals, done = sample
         if self.action_type == "discrete":
             action = F.one_hot(action.long(), self.num_actions)
