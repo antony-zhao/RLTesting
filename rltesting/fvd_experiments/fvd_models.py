@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
-from rltesting.torch_rl.models import MLP
+from rltesting.torch_rl.models import MLP, ChannelNorm
 import numpy as np
 
 def compute_pad(kernel_size, stride):
@@ -17,7 +17,7 @@ class EncoderConv(nn.Module):
             layers.append(nn.Conv2d(image_channels if i == 0 else filters[i - 1], filter, kernel_size, 
                                     stride=2, padding=compute_pad(kernel_size, 2), bias=i == len(filters) - 1))
             if i < len(filters) - 1:
-                layers.append(nn.BatchNorm2d(filter))
+                layers.append(ChannelNorm(filter))
             layers.append(act())
         self.layers = nn.Sequential(*layers)
         size = input_size // (2 ** num_convs)
@@ -36,7 +36,7 @@ class DecoderConv(nn.Module):
             layers.append(nn.ConvTranspose2d(filter, image_channels if i == len(filters) - 1 else filters[i + 1], kernel_size, 
                                              stride=2, padding=compute_pad(kernel_size, 2), bias=i == len(filters) - 1))
             if i < len(filters) - 1:
-                layers.append(nn.BatchNorm2d(filters[i + 1]))
+                layers.append(ChannelNorm(filters[i + 1]))
                 layers.append(act())
         layers.append(nn.Sigmoid())
         self.layers = nn.Sequential(*layers)
@@ -109,12 +109,12 @@ class DoubleAutoEncoder(nn.Module):
         return F.mse_loss(image, reconstruction) + F.mse_loss(latent.detach(), latent_reconstruction)
 
 class AEVAE(DoubleAutoEncoder):
-    def __init__(self, encoder, decoder, latent_dim, intrinsic_dim, hidden_dim=256, penalty_coef=1e-5):
+    def __init__(self, encoder, decoder, latent_dim, intrinsic_dim, hidden_dim=256, penalty_coef=1e-4):
         super().__init__(encoder, decoder, latent_dim, intrinsic_dim, hidden_dim)
         # treat intrinsic_encoder as producing the mean
         self.penalty_coef = penalty_coef
         self.intrinsic_encoder = MLP(latent_dim, latent_dim, hidden_dim, act=nn.GELU, skip_connections=False)
-        self.intrinsic_decoder = MLP(intrinsic_dim, latent_dim, hidden_dim, act=nn.GELU, skip_connections=False)
+        self.intrinsic_decoder = MLP(intrinsic_dim, latent_dim, hidden_dim, num_hiddens=0, act=nn.GELU, skip_connections=False)
         self.intrinsic_mu = nn.Linear(latent_dim, intrinsic_dim)
         self.intrinsic_logvar = nn.Linear(latent_dim, intrinsic_dim)
     
@@ -141,15 +141,16 @@ class AEVAE(DoubleAutoEncoder):
         intrinsic = reparameterize(intrinsic_mu, intrinsic_logvar)
         return intrinsic
     
-    def reconstruction_loss(self, image):
+    def reconstruction_loss(self, image, penalty_coef=None):
         latent = self.encoder(image)
-        temp = self.intrinsic_encoder(latent.detach())
+        temp = self.intrinsic_encoder(latent)
         intrinsic_mu = self.intrinsic_mu(temp)
         intrinsic_logvar = self.intrinsic_logvar(temp)
         intrinsic = reparameterize(intrinsic_mu, intrinsic_logvar)
-        reconstructed_latent = self.reconstruct_latent(intrinsic)
-        reconstruction = self.reconstruct_image(latent)
-        return F.mse_loss(image, reconstruction) + F.mse_loss(latent.detach(), reconstructed_latent) + vae_kl(intrinsic_mu, intrinsic_logvar).sum(-1).mean() * self.penalty_coef
+        reconstruction = self.double_decode(intrinsic)
+        kl_penalty = vae_kl(intrinsic_mu, intrinsic_logvar).mean() * (self.penalty_coef if penalty_coef is None else penalty_coef)
+        reconstruction_losses = F.mse_loss(image, reconstruction)
+        return reconstruction_losses + kl_penalty
 
 class HybridAEVAE(AEVAE):
     def __init__(self, encoder, decoder, latent_dim, intrinsic_dim, num_codes=20, hidden_dim=256, penalty_coef=1e-5):

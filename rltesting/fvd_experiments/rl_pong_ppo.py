@@ -184,13 +184,13 @@ def main(args):
         rollout.reset()
         anneal_lr(ppo_opt, args.lr, i, total_updates)
         
-        for _ in range(args.num_ae_steps):
-            # Update AE
-            obs_sample = torch.tensor(buffer.sample(256)[0]).to(device) / 255.0
-            ae_loss = double_ae.reconstruction_loss(obs_sample)
-            ae_opt.zero_grad()
-            ae_loss.backward()
-            ae_opt.step()
+        # for _ in range(args.num_ae_steps):
+        #     # Update AE
+        #     obs_sample = torch.tensor(buffer.sample(256)[0]).to(device) / 255.0
+        #     ae_loss = double_ae.reconstruction_loss(obs_sample)
+        #     ae_opt.zero_grad()
+        #     ae_loss.backward()
+        #     ae_opt.step()
         
         if i % 10 == 0:
             print(f"Update {i}/{total_updates} | AE Loss: {ae_loss.item():.4f}")
@@ -198,7 +198,7 @@ def main(args):
 if __name__ == '__main__':
     from argparse import ArgumentParser
     parser = ArgumentParser()
-    parser.add_argument('--env', type=str, default='Boxing') #MontezumaRevenge
+    parser.add_argument('--env', type=str, default='Pong')
     parser.add_argument('--discount', type=float, default=0.99)
     parser.add_argument('--clip', type=float, default=0.1)
     parser.add_argument('--val-coef', type=float, default=0.5)

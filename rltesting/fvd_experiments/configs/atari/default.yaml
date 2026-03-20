@@ -12,10 +12,10 @@ data:
 
 model:
   latent_dim: 1024
-  model_path: rltesting/fvd_experiments/models/boxing.pt
+  model_path: rltesting/fvd_experiments/models/pong.pt
 
 training:
-  train_steps: 50000
+  train_steps: 40000
   learning_rate: 3.0e-4
   penalty_coeff: 1.0e-4
 
