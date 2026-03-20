@@ -76,6 +76,7 @@ class ReplayBuffer:
                 idx = np.random.randint(0, self.buffer_size - seq_len, size=batch_size)
                 idx = (self.index + idx) % self.buffer_size
                 indices = idx
+        indices = (indices[:, None] + np.arange(seq_len)[None, :]) % self.buffer_size
         return indices
     
     def sample(self, batch_size=256, seq_len=1, indices=None):
@@ -234,8 +235,8 @@ class TrajectoryReplayBuffer(ReplayBuffer):
     def sample_with_goals(self, batch_size=256, seq_len=1, discount=0.99):
         indices = self.sample_indices(batch_size, seq_len)
         data = self.sample(indices=indices)
-        goals = self.sample_goals(indices, discount)
-        traj_ids = self.indices[indices, 0]
+        goals = self.sample_goals(indices[:, 0], discount)
+        traj_ids = self.indices[indices[:, 0], 0]
         return data, goals, traj_ids
 
     def get_state(self):
@@ -268,14 +269,17 @@ class PerEnvBuffer:
                 prioritized=prioritized) for _ in range(num_envs)
         ]
         self.num_envs = num_envs
+        self._num_items = None
+        self.size = 0
     
     @property
     def num_items(self):
         if self._num_items is None:
             self._num_items = len(self.buffers[0].buffers)
         return self._num_items
-    
+        
     def add_sample(self, sample, idxs=None):
+        self.size += self.num_envs
         if idxs is None:
             idxs = list(range(self.num_envs))
         for i in idxs:

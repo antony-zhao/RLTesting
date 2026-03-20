@@ -18,18 +18,19 @@ class PolicyModel(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.state_size = config.state_size
+        self.latent_size = config.latent_size
         self.action_dim = config.action_dim
         self.action_type = config.action_type
         if self.action_type == "continuous":
-            self.policy_mu = ScalingMLP(self.state_size * 2, self.action_dim, config.num_blocks, config.hidden_dim, config.act)
+            self.policy_mu = ScalingMLP(self.state_size + self.latent_size, self.action_dim, config.num_blocks, config.hidden_dim, config.act)
             self.policy_logstd = nn.Parameter(torch.zeros(1, self.action_dim))
         else:
-            self.policy = ScalingMLP(self.state_size * 2, self.action_dim, config.num_blocks, config.hidden_dim, config.act)
+            self.policy = ScalingMLP(self.state_size + self.latent_size, self.action_dim, config.num_blocks, config.hidden_dim, config.act)
             self.actor_unimix = config.actor_unimix
     
     def policy_dist(self, x, goal=None):
         if goal is None:
-            goal = torch.zeros_like(x)
+            goal = torch.zeros((x.shape[0], self.latent_size)).to(x.device)
         x = torch.concat([x, goal], -1)
         logits = self.policy(x)
         if self.action_type == "discrete":
@@ -60,10 +61,10 @@ class PolicyModel(nn.Module):
 class ContrastiveCritic(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.state_size = config.state_size
+        self.latent_size = config.obs_dim
         self.action_dim = config.action_dim
-        self.g_encoder = ScalingMLP(config.state_size, config.repr_dim, config.num_blocks, config.hidden_dim, config.act)
-        self.sa_encoder = ScalingMLP(config.state_size + config.action_dim, config.repr_dim, config.num_blocks, config.hidden_dim, config.act)
+        self.g_encoder = ScalingMLP(self.latent_size, config.repr_dim, config.num_blocks, config.hidden_dim, config.act)
+        self.sa_encoder = ScalingMLP(self.latent_size + config.action_dim, config.repr_dim, config.num_blocks, config.hidden_dim, config.act)
     
     def logits_matrix(self, obs, action, obs_f):
         sa_repr = self.sa_encoder(torch.concat([obs, action], -1))
@@ -74,13 +75,14 @@ class ContrastiveCritic(nn.Module):
     def q_values(self, obs, action, obs_f):
         sa_repr = self.sa_encoder(torch.concat([obs, action], -1))
         g_repr = self.g_encoder(obs_f)
-        if len(sa_repr.shape) == 3:
+        if sa_repr.shape[0] != g_repr.shape[0]:
             g_repr = g_repr[:, None, :]
+            sa_repr = sa_repr.view(g_repr.shape[0], self.action_dim, -1)
         logits = -torch.sqrt(torch.sum((sa_repr - g_repr) ** 2, dim=-1))
         return logits
 
-class DreamerV3:
-    def __init__(self, config):
+class DreamerCRL:
+    def __init__(self, config, obs_to_goal=None):
         self.config = config
         self.device = config.device
         self.world_model = DreamerWorldModel(config).to(self.device)
@@ -89,12 +91,13 @@ class DreamerV3:
         self.contrastive_critic = ContrastiveCritic(config).to(self.device)
         self.critic_target = TargetNetwork(self.critic, config.critic_tau)
         self.optim_wm = Adam(self.world_model.parameters(), config.wm_lr, eps=1e-5)
-        self.optim_actor = Adam(self.actor.parameters(), config.ac_lr, eps=1e-5)
-        self.optim_critic = Adam(self.critic.parameters(), config.ac_lr, eps=1e-5)
-        self.optim_contrastive_critic = Adam(self.contrastive_critic.parameters(), config.ac_lr, eps=1e-5)
+        self.optim_actor = Adam(self.actor.parameters(), config.actor_lr, eps=1e-5)
+        self.optim_critic = Adam(self.critic.parameters(), config.critic_lr, eps=1e-5)
+        self.optim_contrastive_critic = Adam(self.contrastive_critic.parameters(), config.contrastive_lr, eps=1e-5)
         self.log_alpha_crl = nn.Parameter(torch.tensor(0.0).to(self.device))
         self.alpha_optim = Adam([self.log_alpha_crl], 3e-4)
-        self.init_models()
+        self.obs_to_goal = obs_to_goal
+        # self.init_models()
         
         if config.obs_type == "image":
             self.is_image = True
@@ -114,6 +117,7 @@ class DreamerV3:
         self.return_range_tau = config.return_range_tau
         # Used for calculating the range of returns to help normalize the reinforce gradient
         
+        self.target_entropy = -config.action_dim * 0.5 if config.action_type == "continuous" else 0.3 * np.log(config.action_dim)
         self.gamma = config.gamma
         self.lambda_ = config.lambda_
         self.percentiles = config.percentiles
@@ -133,7 +137,7 @@ class DreamerV3:
     
     def choose_action(self, obs, goal=None, det=False):
         state, latent = self.obs_to_state(obs, self.active_hidden)
-        goal_state = self.obs_to_state(goal)[0] if goal is not None else None
+        goal_state = self.obs_to_state(goal)[0][:, :self.config.latent_size] if goal is not None else None
         action = self.actor.policy_fn(state, goal_state, det)
         return action, latent
     
@@ -141,7 +145,7 @@ class DreamerV3:
         if reset:
             self.eval_hidden = self.world_model._get_hidden(1)
         state, latent = self.obs_to_state(obs, self.eval_hidden)
-        goal_state = self.obs_to_state(goal)[0] if goal is not None else None
+        goal_state = self.obs_to_state(goal)[0][:, :self.config.latent_size] if goal is not None else None
         action = self.actor.policy_fn(state, goal_state, det)
         self.eval_hidden = self.world_model.recurrent_step(self.eval_hidden, latent, action).detach()
         return to_numpy(action)
@@ -184,37 +188,51 @@ class DreamerV3:
         obs, actions, rewards, dones = sample
         if self.config.action_type == "discrete":
             actions = F.one_hot(actions.long(), self.config.action_dim).float()
-        loss_wm, loss_dict, new_states = self.world_model.world_model_loss(obs, actions, rewards, dones)
+        loss_wm, loss_dict, new_states, encoder_repr = self.world_model.world_model_loss(obs, actions, rewards, dones)
         self.optim_wm.zero_grad()
         loss_wm.backward()
         torch.nn.utils.clip_grad_norm_(self.world_model.parameters(), 5)
         self.optim_wm.step()
         
-        future_states, _ = self.obs_to_state(future_obs)
-        # states, rewards, continues, log_probs, entropy = self.imagine_rollout(new_states.reshape(-1, self.config.state_size))
-        # continues[0] = (1 - dones.flatten())
+        loss_critic = loss_actor = torch.tensor(0.0)
+        actor_metrics = critic_metrics = {}
+        
+        if self.buffer.size > 10_000:
+            # future_states, _ = self.obs_to_state(future_obs)
+            # future_states = future_states.detach()
+            hidden_state = new_states[:, :, self.config.latent_size:]
+            contrastive_state = torch.cat([encoder_repr, hidden_state], -1)
+            crl_states, crl_actions, future_latent, crl_obs, crl_future_obs = self.extract_crl_pairs(contrastive_state, actions, dones, obs)
+            # states, rewards, continues, log_probs, entropy = self.imagine_rollout(new_states.reshape(-1, self.config.state_size))
+            # continues[0] = (1 - dones.flatten())
+                
+            # loss_critic, returns, values = self.reinforce_critic_loss(states, rewards, continues)
+            # loss_actor, actor_ent = self.reinforce_actor_loss(returns, values, log_probs, entropy)
+            new_states_start = new_states[:, 0]
+            loss_actor, actor_metrics = self.contrastive_actor_loss(crl_states, future_latent, crl_obs, crl_future_obs)
+            loss_critic, critic_metrics = self.contrastive_critic_loss(obs[:, 0], actions[:, 0], future_obs)
             
-        # loss_critic, returns, values = self.reinforce_critic_loss(states, rewards, continues)
-        # loss_actor, actor_ent = self.reinforce_actor_loss(returns, values, log_probs, entropy)
-        new_states_start = new_states[:, 0]
-        loss_critic, _ = self.contrastive_critic_loss(new_states_start, actions[:, 0], future_states)
-        loss_actor, _ = self.contrastive_actor_loss(new_states_start, future_states)
-        
-        self.optim_critic.zero_grad()
-        self.optim_contrastive_critic.zero_grad()
-        loss_critic.backward()
-        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 5)
-        self.optim_critic.step()
-        self.optim_contrastive_critic.step()
-        self.optim_actor.zero_grad()
-        loss_actor.backward()
-        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 5)
-        self.optim_actor.step()
-        
-        loss_dict["loss/actor loss"] = to_numpy(loss_actor)
-        loss_dict["loss/critic loss"] = to_numpy(loss_critic)
+            self.optim_actor.zero_grad()
+            loss_actor.backward()
+            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 5)
+            self.optim_actor.step()
+            
+            self.optim_critic.zero_grad()
+            self.optim_contrastive_critic.zero_grad()
+            loss_critic.backward()
+            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 5)
+            self.optim_critic.step()
+            self.optim_contrastive_critic.step()
+            
+            self.alpha_optim.zero_grad()
+            alpha_loss = self.alpha_loss(crl_states, future_latent)
+            alpha_loss.backward()
+            self.alpha_optim.step()
+            
+            loss_dict["loss/actor loss"] = to_numpy(loss_actor)
+            loss_dict["loss/critic loss"] = to_numpy(loss_critic)
         # loss_dict["loss/actor entropy"] = to_numpy(actor_ent)
-        return to_numpy(loss_wm), to_numpy(loss_critic), to_numpy(loss_actor), loss_dict 
+        return to_numpy(loss_wm), to_numpy(loss_critic), to_numpy(loss_actor), loss_dict | actor_metrics | critic_metrics
     
     def train_actor(self, returns, values, log_probs, entropy, states, goal_states):
         r_actor_loss, actor_ent = self.reinforce_actor_loss(returns, values, log_probs, entropy)
@@ -251,19 +269,23 @@ class DreamerV3:
         loss = loss.mean()
         return loss, returns.detach(), values.detach()[:-1] # returning returns and values for the actor to reuse later
         
-    def contrastive_actor_loss(self, states, goal_states):
+    def contrastive_actor_loss(self, states, goal_states, obs, future_obs):
         states = torch.cat([states, states], dim=0)
         random_goals = torch.roll(goal_states, shifts=1, dims=0)
         goal_states = torch.cat([goal_states, random_goals], dim=0)
+        obs = torch.cat([obs, obs], dim=0)
+        random_obs_f = torch.roll(future_obs, shifts=1, dims=0)
+        future_obs = torch.cat([future_obs, random_obs_f], dim=0)
         B = states.shape[0]
         
         action_dist = self.actor.policy_dist(states, goal_states)
         alpha = torch.exp(self.log_alpha_crl).detach()
         
+        latents = states[:, :self.config.latent_size]
         if self.action_type == "continuous":
             action = action_dist.rsample()
             log_prob = action_dist.log_prob(action).sum(-1)
-            q_values = self.contrastive_critic.q_values(states, action, goal_states)
+            q_values = self.contrastive_critic.q_values(obs, action, future_obs)
             if self.use_alpha:
                 loss = (-q_values + alpha * log_prob).mean()
             else:
@@ -271,10 +293,10 @@ class DreamerV3:
         else:
             probs = action_dist.probs
             log_probs = action_dist.logits
-            obs_expanded = states.repeat_interleave(self.num_actions, dim=0)
+            obs_expanded = obs.repeat_interleave(self.num_actions, dim=0)
             one_hots = torch.eye(self.num_actions, device=states.device).repeat(B, 1)
 
-            q_values = self.contrastive_critic.q_values(obs_expanded, one_hots, goal_states)
+            q_values = self.contrastive_critic.q_values(obs_expanded, one_hots, future_obs)
             if self.use_alpha:
                 alpha = torch.exp(self.log_alpha_crl).detach()
                 loss = (probs * (alpha * log_probs - q_values)).sum(-1).mean()
@@ -284,7 +306,8 @@ class DreamerV3:
         return loss, {"alpha": to_numpy(alpha), "contrastive_entropy": to_numpy(action_dist.entropy().mean())}
     
     def contrastive_critic_loss(self, states, actions, future_states):
-        logits = self.contrastive_critic.logits_matrix(states, actions, future_states)
+        latents = states[:, :self.config.latent_size]
+        logits = self.contrastive_critic.logits_matrix(latents, actions, future_states)
         n = logits.shape[0]
         logits_pos = logits.diag().mean()
         logits_neg = (logits.sum() - logits.diag().sum()) / (n * n - n)
@@ -295,6 +318,17 @@ class DreamerV3:
             "logits_pos": to_numpy(logits_pos),
             "logits_neg": to_numpy(logits_neg)
         }
+    
+    def alpha_loss(self, states, goal_states):
+        action_dist = self.actor.policy_dist(states, goal_states)
+        if self.action_type == "continuous":
+            action = action_dist.rsample()
+            log_prob = action_dist.log_prob(action).sum(-1)
+        else:
+            log_prob = (action_dist.probs * action_dist.logits).sum(-1)
+        alpha = torch.exp(self.log_alpha_crl)
+        alpha_loss = alpha * (-log_prob - self.target_entropy).detach()
+        return (alpha_loss).mean()
     
     def checkpoint_models(self, folderpath, filename):
         torch.save(self.world_model.state_dict(), f"{folderpath}/world_model-{filename}.pth")
@@ -320,3 +354,50 @@ class DreamerV3:
         init_last_layer(self.world_model.encoder, nn.init.xavier_uniform_)
         init_last_layer(self.world_model.decoder, nn.init.xavier_uniform_)
         init_last_layer(self.world_model.rssm, nn.init.xavier_uniform_)
+    
+    def extract_crl_pairs(self, states, actions, dones, obs):
+        """
+        Args:
+            states: (B, T, D)
+            actions: (B, T, action_dim)
+            dones: (B, T)
+        """
+        B, T, D = states.shape
+        
+        modified_dones = dones.clone()
+        modified_dones[:, -1] = 1
+        
+        continues = (1 - modified_dones).flip(dims=[1])
+        cs = continues.cumsum(dim=1)
+        reset_vals = cs * (1 - continues)
+        cummax_reset = reset_vals.cummax(dim=1).values
+        count = cs - cummax_reset
+        max_future = count.flip(dims=[1]).long()
+        
+        valid_mask = max_future[:, :-1] > 0  # (B, T-1)
+        
+        offsets = torch.randint(1, T, (B, T - 1), device=states.device)
+        offsets = torch.min(offsets, max_future[:, :-1].clamp(min=1))
+        
+        batch_idx = torch.arange(B, device=states.device).unsqueeze(1).expand(-1, T - 1)
+        time_idx = torch.arange(T - 1, device=states.device).unsqueeze(0).expand(B, -1)
+        future_time = time_idx + offsets
+        
+        current_s = states[:, :-1][valid_mask]
+        current_a = actions[:, :-1][valid_mask]
+        # Future goals: extract latent from full state, pair with fresh hidden
+        future_states_full = states[batch_idx, future_time][valid_mask]  # (N, D)
+        future_latent = future_states_full[:, :self.config.latent_size]  # strip history
+        current_obs = obs[:, :-1][valid_mask]
+        future_obs = obs[batch_idx, future_time][valid_mask]
+        
+        if current_s.shape[0] == 0:
+            return None, None, None
+        
+        # if current_s.shape[0] > self.config.crl_batch_size:
+        #     perm = torch.randperm(current_s.shape[0], device=current_s.device)[:self.config.crl_batch_size]
+        #     current_s = current_s[perm]
+        #     current_a = current_a[perm]
+        #     future_latent = future_latent[perm]
+        
+        return current_s, current_a, future_latent, current_obs, future_obs
