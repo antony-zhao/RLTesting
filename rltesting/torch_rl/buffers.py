@@ -3,32 +3,79 @@ import torch
 
 class SumTree:
     # for future prioritized replay purposes
-    pass
+    # for speed purposes everything is stored inside an array.
+    # ind 1 stores the total sum
+    # ind i stores the sum of i * 2 and i * 2 + 1 (the children)
+    # node i has parent of i // 2
+    def __init__(self, size):
+        self.size = 1 << (size - 1).bit_length() # round to nearest power of 2, for the sake of the vectorized operations.
+        self.array = np.zeros(self.size * 2, dtype=np.float64)
+    
+    def update(self, indices, values):
+        indices = np.atleast_1d(np.asarray(indices, dtype=np.int32))
+        values = np.atleast_1d(np.asarray(values, dtype=np.float64))
+        leaf_indices = indices + self.size
+        self.array[leaf_indices] = values
+        parents = np.unique(leaf_indices // 2)
+        while parents[0] >= 1:
+            self.array[parents] = self.array[parents * 2] + self.array[parents * 2 + 1]
+            parents = np.unique(parents // 2)
+    
+    def query(self, values):
+        values = np.atleast_1d(np.asarray(values, dtype=np.float64)).copy() # allows for both vector and scalar
+        indices = np.ones(len(values), dtype=np.int32)
+        for _ in range(int(np.log2(self.size))):
+            left = indices * 2
+            go_right = values > self.array[left]
+            values -= self.array[left] * go_right
+            indices = left + go_right
+        return indices - self.size
+    
+    @property
+    def total_priority(self):
+        return self.array[1]        
 
 class ReplayBuffer:
     # The vanilla replay buffer
-    def __init__(self, buffer_shapes=[], dtypes=None, buffer_size=1_000_000, prioritized=False, done_index=-1):
+    def __init__(self, buffer_shapes=None, dtypes=None, buffer_size=1_000_000, prioritized=False, done_index=-1):
         self.buffers = []
-        self.temp_buffer = [[] for _ in range(len(buffer_shapes))]
         self.index = 0
         self.buffer_size = buffer_size
         self.total = 0
+        self.done_index = done_index
+        self.weights = SumTree(buffer_size) if prioritized else None
+        self.initialized = False
+
+        if buffer_shapes is not None:
+            self.init_buffers(buffer_shapes, dtypes)
+    
+    def init_buffers(self, buffer_shapes, dtypes=None):
         if dtypes is not None:
             for shape, dtype in zip(buffer_shapes, dtypes):
-                self.buffers.append(np.empty((buffer_size,) + shape, dtype=dtype))
+                self.buffers.append(np.empty((self.buffer_size,) + shape, dtype=dtype))
         else:
             for shape in buffer_shapes:
-                self.buffers.append(np.empty((buffer_size,) + shape))
-        self.weights = np.zeros(buffer_size) if prioritized else None
-        self.done_index = done_index
+                self.buffers.append(np.empty((self.buffer_size,) + shape))
+        self.temp_buffer = [[] for _ in range(len(self.buffers))]
+        self.initialized = True
+
+    def lazy_init(self, sample):
+        shapes = []
+        dtypes = []
+        for s in sample:
+            s = np.asarray(s)
+            shapes.append(s.shape)
+            dtypes.append(s.dtype)
+        self.init_buffers(shapes, dtypes)
     
     def sample_indices(self, batch_size, seq_len=1):
         if self.weights is None:
             if self.total < self.buffer_size:
                 indices = np.random.randint(0, min(self.total - seq_len, self.buffer_size), size=batch_size)
             else:
-                valid_indices = list(range(0, self.index - seq_len)) + list(range(self.index, self.buffer_size))
-                indices = np.random.choice(valid_indices, size=batch_size)
+                idx = np.random.randint(0, self.buffer_size - seq_len, size=batch_size)
+                idx = (self.index + idx) % self.buffer_size
+                indices = idx
         return indices
     
     def sample(self, batch_size=256, seq_len=1, indices=None):
@@ -44,21 +91,12 @@ class ReplayBuffer:
         return sampled
     
     def add_sample(self, sample):
+        if not self.initialized:
+            self.lazy_init(sample)
         for i, buffer in enumerate(self.buffers):
             buffer[self.index] = sample[i]
         self.index = (self.index + 1) % self.buffer_size
         self.total += 1
-    
-    def add_sample_until_episode_terminal(self, sample):
-        # use if the ordering of the data matters (i.e. recurrent) so that there won't be a weird 
-        # transition between an incomplete and an old episode.
-        for i in range(len(self.buffers)):
-            self.temp_buffer[i].append(sample[i])
-        if sample[-1]:
-            for i in range(len(self.buffers)):
-                self.temp_buffer[i] = np.stack(self.temp_buffer[i])
-            self.add_samples(self.temp_buffer)
-            self.temp_buffer = [[] for _ in range(len(self.buffers))]
     
     def add_samples(self, data_samples):
         # used mainly for adding full episodes but can also handle small rollouts
@@ -221,7 +259,7 @@ class TrajectoryReplayBuffer(ReplayBuffer):
         self.trajectory_bounds = state['trajectory_bounds'][0]
 
 class PerEnvBuffer:
-    def __init__(self, num_envs, buffer_shapes=[], dtypes=None, buffer_size=1_000_000, prioritized=False, buffer_class=ReplayBuffer):
+    def __init__(self, num_envs, buffer_shapes=None, dtypes=None, buffer_size=1_000_000, prioritized=False, buffer_class=ReplayBuffer):
         self.buffers = [
             buffer_class(
                 buffer_shapes=buffer_shapes, 
@@ -230,7 +268,12 @@ class PerEnvBuffer:
                 prioritized=prioritized) for _ in range(num_envs)
         ]
         self.num_envs = num_envs
-        self.num_items = len(buffer_shapes)
+    
+    @property
+    def num_items(self):
+        if self._num_items is None:
+            self._num_items = len(self.buffers[0].buffers)
+        return self._num_items
     
     def add_sample(self, sample, idxs=None):
         if idxs is None:
@@ -281,7 +324,7 @@ class PerEnvBuffer:
                 buf.set_state(env_state)
                 
 class PerEnvTrajectoryBuffer(PerEnvBuffer):
-    def __init__(self, num_envs, buffer_shapes=[], dtypes=None, buffer_size=1_000_000, prioritized=False, **kwargs):
+    def __init__(self, num_envs, buffer_shapes=None, dtypes=None, buffer_size=1_000_000, prioritized=False, **kwargs):
         super().__init__(
             num_envs=num_envs, 
             buffer_class=TrajectoryReplayBuffer, 
