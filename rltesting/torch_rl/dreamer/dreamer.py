@@ -25,7 +25,7 @@ class DreamerEncoder(nn.Module):
             self.encoder = DreamerEncoderConv(config.filter_base, config.num_convs, config.kernel_size, config.num_channels, config.image_size, config.act)
             output_dim = np.prod(self.encoder.output_size)
         else:
-            self.encoder = nn.Linear(config.obs_dim, config.hidden_dim)#DreamerMLP(config.obs_dim, config.hidden_dim, config.hidden_dim, num_hiddens=config.num_hiddens_world_model)
+            self.encoder = nn.Linear(config.obs_dim, config.hidden_dim) #DreamerMLP(config.obs_dim, config.hidden_dim, config.hidden_dim, num_hiddens=config.num_hiddens_world_model)
             output_dim = config.hidden_dim
         self.out = DreamerMLP(output_dim + config.hidden_state_size, config.latent_size, config.hidden_dim, 
                        num_hiddens=config.num_hiddens_world_model)
@@ -177,15 +177,15 @@ class DreamerWorldModel(nn.Module):
         enc_probs = []
         dyn_probs = []
         states = []
-        transformed_obs = transform_obs(obs, self.is_image)
+        transformed_obs = transform_obs(obs, self.is_image).transpose(0, 1).contiguous()
         if self.is_image:
-            B, T, C, H, W = transformed_obs.shape
+            T, B, C, H, W = transformed_obs.shape
             flat_transform_obs = transformed_obs.reshape(B * T, C, H, W)
         else:
-            B, T, dim = transformed_obs.shape
+            T, B, dim = transformed_obs.shape
             flat_transform_obs = transformed_obs.reshape(B * T, dim)
         obs_embeddings = self.encoder.embed_observations(flat_transform_obs)
-        obs_embeddings = obs_embeddings.reshape(B, T, -1).transpose(0, 1)
+        obs_embeddings = obs_embeddings.reshape(T, B, -1)
         actions = actions.transpose(0, 1).contiguous()
         rewards = rewards.transpose(0, 1).contiguous()
         dones = dones.transpose(0, 1).contiguous()
@@ -207,7 +207,7 @@ class DreamerWorldModel(nn.Module):
         dyn_probs = torch.stack(dyn_probs)
         continue_preds = self.continue_predictor(states)
         reward_logits = self.reward_predictor(states)
-        reconstructions = self.decoder.from_state(states.reshape(T * B, -1)).reshape(obs.shape)
+        reconstructions = self.decoder.from_state(states.reshape(T * B, -1)).reshape(transformed_obs.shape)
         pred_loss, loss_dict = self.prediction_loss(transformed_obs, reconstructions, rewards, reward_logits, dones, continue_preds)
         dyn_loss = self.dynamics_loss(enc_probs, dyn_probs)
         rep_loss = self.representation_loss(enc_probs, dyn_probs)

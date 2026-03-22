@@ -77,6 +77,8 @@ class ReplayBuffer:
                 idx = (self.index + idx) % self.buffer_size
                 indices = idx
         indices = (indices[:, None] + np.arange(seq_len)[None, :]) % self.buffer_size
+        if seq_len == 1:
+            indices = indices[:, 0]
         return indices
     
     def sample(self, batch_size=256, seq_len=1, indices=None):
@@ -234,9 +236,10 @@ class TrajectoryReplayBuffer(ReplayBuffer):
 
     def sample_with_goals(self, batch_size=256, seq_len=1, discount=0.99):
         indices = self.sample_indices(batch_size, seq_len)
+        goal_indices = indices[:, 0] if seq_len > 1 else indices
         data = self.sample(indices=indices)
-        goals = self.sample_goals(indices[:, 0], discount)
-        traj_ids = self.indices[indices[:, 0], 0]
+        goals = self.sample_goals(goal_indices, discount)
+        traj_ids = self.indices[goal_indices, 0]
         return data, goals, traj_ids
 
     def get_state(self):

@@ -55,11 +55,12 @@ def parse_args():
     parser.add_argument("--num_bins", default=255, type=int)
 
     # Training
-    parser.add_argument("--sample_batch_size", default=16, type=int)
+    parser.add_argument("--sample_batch_size", default=64, type=int)
     parser.add_argument("--crl_batch_size", default=256, type=int)
     parser.add_argument("--sample_seq_len", default=64, type=int)
     parser.add_argument("--rollout_length", default=16, type=int)
-    parser.add_argument("--train_steps_per_update", default=8, type=int)
+    parser.add_argument("--train_steps_per_update", default=1, type=int)
+    parser.add_argument("--crl_steps_per_train", default=16, type=int)
 
     # Dreamer actor-critic
     parser.add_argument("--critic_tau", default=0.02, type=float)
@@ -115,31 +116,17 @@ def parse_args():
 def evaluate(agent, eval_env, config, num_episodes=32, max_steps=500):
     (obs, goal), _ = eval_env.reset()
     n = eval_env.num_envs
-
     successes = []
     episodes_done = 0
     steps = 0
-
-    agent.eval_hidden = agent.world_model._get_hidden(n)
 
     while episodes_done < num_episodes and steps < max_steps:
         with torch.no_grad():
             obs_t = torch.as_tensor(obs, dtype=torch.float32, device=config.device)
             goal_t = torch.as_tensor(goal, dtype=torch.float32, device=config.device)
+            action = agent.eval_action(obs_t, goal_t, reset=(steps == 0))
 
-            state, latent = agent.obs_to_state(obs_t, agent.eval_hidden)
-            goal_state = agent.obs_to_state(goal_t)[0][:, :config.latent_size]
-
-            action = agent.actor.policy_fn(state, goal_state, det=False)
-
-            action_for_env = action.cpu().numpy()
-
-            continue_ = torch.ones(n, 1, device=config.device)
-            agent.eval_hidden = (continue_ * agent.world_model.recurrent_step(
-                agent.eval_hidden, latent, action
-            )).detach()
-
-        (obs, goal), rewards, terminations, truncations, infos = eval_env.step(action_for_env)
+        (obs, goal), rewards, terminations, truncations, infos = eval_env.step(action)
         steps += 1
 
         dones = terminations | truncations
@@ -148,15 +135,14 @@ def evaluate(agent, eval_env, config, num_episodes=32, max_steps=500):
                 successes.append(bool(terminations[i]))
             episodes_done += dones.sum()
 
+            # Reset hidden for done envs
             done_t = torch.as_tensor(dones, dtype=torch.float32, device=config.device).unsqueeze(1)
             agent.eval_hidden = (
                 (1 - done_t) * agent.eval_hidden +
                 done_t * agent.world_model._get_hidden(n)
             ).detach()
 
-    success_rate = np.mean(successes) if successes else 0.0
-    return success_rate
-
+    return np.mean(successes) if successes else 0.0
 
 if __name__ == "__main__":
     config = parse_args()
