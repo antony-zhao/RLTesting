@@ -93,23 +93,20 @@ def make_env(config):
     return thunk
 
 def eval(dreamer, eval_env, config):
-    done = False
     obs = eval_env.reset()
-    total_reward = 0
-    num_completed = 0
     is_first = True
+    total_reward = 0
     frames = []
     obs_traj = []
-    while not done:
+    while True:
         action = dreamer.eval_action(torch.tensor(obs).float().to(config.device), reset=is_first)
         is_first = False
         obs, reward, done, infos = eval_env.step(action)
         frames.append(eval_env.render())
         obs_traj.append(obs)
-        for info in infos:
-            if 'episode' in info.keys():
-                total_reward += info['episode']['r']
-                num_completed += 1
+        if done[0]:
+            total_reward = infos[0]['episode']['r']
+            break
     return total_reward, obs_traj, frames
 
 def imagine_rollout(dreamer, eval_env, config):
@@ -141,7 +138,8 @@ if __name__ == "__main__":
         timestep += config.num_envs
         if i % 100 == 0:
             print(i)
-        action, latent = dreamer.choose_action(torch.tensor(obs).float().to(config.device))
+        with torch.no_grad():
+            action, latent = dreamer.choose_action(torch.tensor(obs).float().to(config.device))
         next_obs, reward, done, info = env.step(to_numpy(action))
         dreamer.process_sample(obs, latent, action, reward, done)
         if True in done:

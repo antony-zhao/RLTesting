@@ -408,7 +408,7 @@ class DreamerV3:
     def train_actor(self, returns, values, action_log_probs, entropy):
         range_ = torch.quantile(returns, 1 - self.percentiles) - torch.quantile(returns, self.percentiles)
         if self.range_ema is not None:
-            self.range_ema = range_ * self.return_range_tau + self.range_ema * (1 - self.return_range_tau)
+            self.range_ema =(range_ * self.return_range_tau + self.range_ema * (1 - self.return_range_tau)).detach()
         else:
             self.range_ema = range_
         
