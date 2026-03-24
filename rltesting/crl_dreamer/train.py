@@ -73,7 +73,7 @@ def parse_args():
 
     # Contrastive RL
     parser.add_argument("--repr_dim", default=64, type=int)
-    parser.add_argument("--num_blocks", default=2, type=int)
+    parser.add_argument("--num_blocks", default=1, type=int)
     parser.add_argument("--penalty", default=0.1, type=float)
     parser.add_argument("--use_alpha", default=True, type=bool)
     parser.add_argument("--target_entropy_scale", default=0.5, type=float)
@@ -97,6 +97,7 @@ def parse_args():
     # Derived config values
     config.latent_size = config.num_categoricals * config.num_codes
     config.state_size = config.latent_size + config.hidden_state_size
+    config.contrastive_state_size = config.hidden_dim + config.hidden_state_size
 
     if config.log_interval is None:
         config.log_interval = config.num_envs * config.episode_length

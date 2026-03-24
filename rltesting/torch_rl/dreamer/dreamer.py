@@ -96,21 +96,17 @@ class RSSM(nn.Module):
     # Also called the sequence model
     def __init__(self, config):
         super().__init__()
-        self.in_hidden = nn.Linear(config.hidden_state_size, config.hidden_dim)
-        self.in_latent = nn.Linear(config.num_categoricals * config.num_codes, config.hidden_dim)
-        self.in_action = nn.Linear(config.action_dim, config.hidden_dim) # the required input layers for each of the three needed inputs
+        self.in_proj = nn.Linear(config.hidden_state_size + config.latent_size + config.action_dim, config.hidden_dim * 3)
         self.act1 = NormAndAct(config.hidden_dim * 3)
         self.mlp = DreamerMLP(config.hidden_dim * 3, config.hidden_state_size, config.hidden_dim, num_hiddens=config.num_hiddens_world_model)
         self.gru = DreamerGRU(config.hidden_state_size, config.use_block_linear)
     
     def forward(self, z, h, a):
-        x1 = self.in_hidden(h)
-        x2 = self.in_latent(z)
-        x3 = self.in_action(a)
-        x = torch.cat([x1, x2, x3], -1)
+        x = torch.cat([z, h, a], -1)
+        x = self.in_proj(x)
         x = self.act1(x)
         x = self.mlp(x)
-        h_new = self.gru(x)
+        h_new = self.gru(x, h)
         return h_new
 
 class DreamerWorldModel(nn.Module):
@@ -141,13 +137,12 @@ class DreamerWorldModel(nn.Module):
         with torch.no_grad():
             state = torch.cat([latent, hidden], -1)
             continue_prob = F.sigmoid(self.continue_predictor(state))
-            continue_ = ((continue_prob) > 0.5).to(continue_prob)
             reward_logits = self.reward_predictor(state)
             reward = WeightedAverageOverBins(self.bins, reward_logits).weighted_average()
-            next_hidden = self.rssm(latent, hidden, action) * continue_ + (1 - continue_) * self._get_hidden(action.shape[0]).detach()
-            probs_dyn = self.dynamics_predictor(hidden)
+            next_hidden = self.rssm(latent, hidden, action)
+            probs_dyn = self.dynamics_predictor(next_hidden)
             next_latent = Independent(OneHotCategoricalStraightThrough(probs_dyn), 1).rsample()
-        return (next_latent, next_hidden), reward, continue_
+        return (next_latent, next_hidden), reward, continue_prob
     
     def dynamic_step(self, obs_embedding, action, done, hidden, is_first):
         h_initial = self._get_hidden(action.shape[0])
@@ -294,7 +289,7 @@ class DreamerV3:
     def __init__(self, config):
         self.config = config
         self.device = config.device
-        self.world_model = DreamerWorldModel(config).to(self.device)
+        self.world_model = torch.compile(DreamerWorldModel(config).to(self.device))
         self.actor = Actor(config).to(self.device)
         self.critic = Critic(config, self.world_model.bins).to(self.device)
         self.init_models()
@@ -311,7 +306,7 @@ class DreamerV3:
             self.is_image = False
             self.buffer = PerEnvBuffer(config.num_envs, [(config.obs_dim,), act_dim, (), ()], buffer_size=1_000_000)
         else:
-            raise NotImplemented
+            raise NotImplementedError
         # buffer needs to account for order in episodes
         self.active_hidden = torch.zeros(config.num_envs, config.hidden_state_size).to(self.device)
         self.eval_hidden = torch.zeros(1, config.hidden_state_size).to(self.device)
@@ -382,23 +377,25 @@ class DreamerV3:
         obs, actions, rewards, dones = self.buffer.sample_as_tensors(self.config.device, self.config.sample_batch_size, self.config.sample_seq_len)
         if self.config.action_type == "discrete":
             actions = F.one_hot(actions.long(), self.config.action_dim).float()
-        loss_wm, loss_dict, new_states, _ = self.world_model.world_model_loss(obs, actions, rewards, dones)
-        self.optim_wm.zero_grad()
+        with torch.amp.autocast(device_type='cuda'):
+            loss_wm, loss_dict, new_states, _ = self.world_model.world_model_loss(obs, actions, rewards, dones)
+        self.optim_wm.zero_grad(set_to_none=True)
         loss_wm.backward()
         torch.nn.utils.clip_grad_norm_(self.world_model.parameters(), 5)
         self.optim_wm.step()
         
         states, rewards, continues, log_probs, entropy = self.imagine_rollout(new_states.reshape(-1, self.config.state_size))
         continues[0] = (1 - dones.flatten())
-            
-        loss_critic, returns, values = self.train_critic(states, rewards, continues)
-        loss_actor, actor_ent = self.train_actor(returns, values, log_probs, entropy)
         
-        self.optim_critic.zero_grad()
+        with torch.amp.autocast(device_type='cuda'):
+            loss_critic, returns, values = self.train_critic(states, rewards, continues)
+            loss_actor, actor_ent = self.train_actor(returns, values, log_probs, entropy)
+        
+        self.optim_critic.zero_grad(set_to_none=True)
         loss_critic.backward()
         torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 5)
         self.optim_critic.step()
-        self.optim_actor.zero_grad()
+        self.optim_actor.zero_grad(set_to_none=True)
         loss_actor.backward()
         torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 5)
         self.optim_actor.step()

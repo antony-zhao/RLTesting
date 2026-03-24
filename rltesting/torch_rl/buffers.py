@@ -86,7 +86,7 @@ class ReplayBuffer:
         # out of order sampling, instead of needing to wait for episode to terminate
         if indices is None:
             indices = self.sample_indices(batch_size, seq_len)
-        if seq_len > 1:
+        elif seq_len > 1:
             indices = np.expand_dims(indices, axis=-1) + np.arange(seq_len)
             indices %= self.buffer_size
             indices = indices.transpose()
@@ -113,10 +113,10 @@ class ReplayBuffer:
     
     def modify_indices(self, buffer_num, indices, data):
         # might not be needed for this but would be good for prioritized replay or dreamerv3
-        raise NotImplemented
+        raise NotImplementedError
     
     def modify_weights(self, indices, weights):
-        raise NotImplemented
+        raise NotImplementedError
     
     def get_state(self):
         state = {
@@ -249,7 +249,7 @@ class TrajectoryReplayBuffer(ReplayBuffer):
         state['trajectory_idx'] = self.trajectory_idx
         state['t'] = self.t
         
-        state['trajectory_bounds'] = np.array([self.trajectory_bounds], dtype=object)
+        state['trajectory_ends'] = np.array([self.trajectory_ends], dtype=object)
         
         return state
 
@@ -260,7 +260,7 @@ class TrajectoryReplayBuffer(ReplayBuffer):
         self.trajectory_idx = int(state['trajectory_idx'])
         self.t = int(state['t'])
         
-        self.trajectory_bounds = state['trajectory_bounds'][0]
+        self.trajectory_ends = state['trajectory_ends'][0]
 
 class PerEnvBuffer:
     def __init__(self, num_envs, buffer_shapes=None, dtypes=None, buffer_size=1_000_000, prioritized=False, buffer_class=ReplayBuffer):
@@ -294,17 +294,20 @@ class PerEnvBuffer:
     
     def sample(self, batch_size, seq_len=1):
         per_env_batch = np.bincount(np.random.randint(0, self.num_envs, batch_size), minlength=self.num_envs)
-        per_env_samples = [self.buffers[i].sample(batch_sizes, seq_len) for i, batch_sizes in enumerate(per_env_batch)]
+        per_env_samples = []
+        for i, batch_sizes in enumerate(per_env_batch):
+            if batch_sizes > 0:
+                per_env_samples.append(self.buffers[i].sample(batch_sizes, seq_len))
         samples = []
         for i in range(self.num_items):
-            samples.append(np.concatenate([sample[i] for sample in per_env_samples], axis=0 if seq_len == 1 else 1))
+            samples.append(np.concatenate([sample[i] for sample in per_env_samples], axis=0))
         
         return samples
     
     def sample_as_tensors(self, device, batch_size, seq_len=1):
         samples = self.sample(batch_size, seq_len)
         
-        samples_tensor = [torch.tensor(sample).to(device).float() for sample in samples]
+        samples_tensor = [torch.from_numpy(sample).pin_memory().to(device, non_blocking=True).float() for sample in samples]
         return samples_tensor
     
     def save(self, filepath):
@@ -365,7 +368,7 @@ class PerEnvTrajectoryBuffer(PerEnvBuffer):
 
     def sample_with_goals_as_tensors(self, device, batch_size, seq_len=1, discount=0.99):
         samples, goals, traj_ids = self.sample_with_goals(batch_size, seq_len, discount)
-        samples_tensors = [torch.tensor(sample).to(device).float() for sample in samples]
+        samples_tensors = [torch.from_numpy(sample).pin_memory().to(device, non_blocking=True).float() for sample in samples]
         goals_tensor = torch.tensor(goals).to(device).float()
         traj_ids = torch.tensor(traj_ids).to(device)
         return samples_tensors, goals_tensor, traj_ids

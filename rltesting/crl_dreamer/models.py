@@ -19,13 +19,14 @@ class PolicyModel(nn.Module):
         super().__init__()
         self.state_size = config.state_size
         self.latent_size = config.latent_size
+        self.contrastive_state_size = config.contrastive_state_size
         self.action_dim = config.action_dim
         self.action_type = config.action_type
         if self.action_type == "continuous":
-            self.policy_mu = ScalingMLP(self.state_size + self.latent_size, self.action_dim, config.num_blocks, config.hidden_dim, config.act)
+            self.policy_mu = ScalingMLP(self.contrastive_state_size + self.latent_size, self.action_dim, config.num_blocks, config.hidden_dim, config.act)
             self.policy_logstd = nn.Parameter(torch.zeros(1, self.action_dim))
         else:
-            self.policy = ScalingMLP(self.state_size + self.latent_size, self.action_dim, config.num_blocks, config.hidden_dim, config.act)
+            self.policy = ScalingMLP(self.contrastive_state_size + self.latent_size, self.action_dim, config.num_blocks, config.hidden_dim, config.act)
             self.actor_unimix = config.actor_unimix
     
     def policy_dist(self, x, goal=None):
@@ -148,8 +149,8 @@ class DreamerCRL:
             self.eval_hidden = self.world_model._get_hidden(obs.shape[0])
         state, latent = self.obs_to_contrastive_state(obs, self.eval_hidden)
         goal_state = self.obs_to_state(goal)[0][:, :self.config.latent_size] if goal is not None else None
-        dist = self.actor.policy_dist(state, goal_state)
-        print(f"action probs: {dist.probs[0].detach().cpu().numpy().round(3)}")
+        # dist = self.actor.policy_dist(state, goal_state)
+        # print(f"action probs: {dist.probs[0].detach().cpu().numpy().round(3)}")
         action = self.actor.policy_fn(state, goal_state, det)
         self.eval_hidden = self.world_model.recurrent_step(self.eval_hidden, latent, action).detach()
         return to_numpy(action)
@@ -202,6 +203,8 @@ class DreamerCRL:
         actor_metrics = critic_metrics = {}
         
         if self.buffer.size > 50_000:
+            transformed_obs = transform_obs(obs, self.is_image)
+            encoder_repr = self.world_model.encoder.embed_observations(transformed_obs).detach()
             # Sequence-based CRL from world model states
             hidden_state = new_states[:, :, self.config.latent_size:]
             contrastive_state = torch.cat([encoder_repr, hidden_state], -1)
@@ -252,7 +255,7 @@ class DreamerCRL:
                 
                 # Actor state from RSSM (cold-encoded, no history)
                 with torch.no_grad():
-                    buf_state, _ = self.obs_to_state(buf_obs)
+                    buf_state, _ = self.obs_to_contrastive_state(buf_obs)
                 buf_state = buf_state.detach()
                 
                 # Goal obs and goal latent
@@ -264,22 +267,16 @@ class DreamerCRL:
                 # loss_actor, actor_metrics = self.contrastive_actor_loss(buf_state, buf_goal_latent, buf_obs, buf_goal_obs)
                 loss_critic, critic_metrics = self.contrastive_critic_loss(buf_obs, buf_actions, buf_goal_obs)
                 
-                # self.optim_actor.zero_grad()
+                # self.optim_contrastive_actor.zero_grad()
                 # loss_actor.backward()
-                # torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 5)
-                # self.optim_actor.step()
+                # self.optim_contrastive_actor.step()
                 
                 self.optim_contrastive_critic.zero_grad()
                 loss_critic.backward()
                 self.optim_contrastive_critic.step()
-                
-            #     # self.alpha_optim.zero_grad()
-            #     # alpha_loss = self.alpha_loss(buf_state, buf_goal_latent)
-            #     # alpha_loss.backward()
-            #     # self.alpha_optim.step()
         
-        loss_dict["loss/actor loss"] = to_numpy(loss_actor)
-        loss_dict["loss/critic loss"] = to_numpy(loss_critic)
+            loss_dict["loss/actor loss"] = to_numpy(loss_actor)
+            loss_dict["loss/critic loss"] = to_numpy(loss_critic)
     
         return to_numpy(loss_wm), to_numpy(loss_critic), to_numpy(loss_actor), loss_dict | actor_metrics | critic_metrics
     

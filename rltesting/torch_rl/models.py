@@ -217,8 +217,8 @@ class DreamerGRU(nn.Module):
             self.layer = nn.Linear(hidden_state_size, hidden_state_size * 3)
         self.hidden_state_size = hidden_state_size
     
-    def forward(self, h):
-        x = self.layer(h)
+    def forward(self, x, h):
+        x = self.layer(x)
         reset, cand, update = torch.split(x, self.hidden_state_size, -1)
         reset = F.sigmoid(reset)
         cand = F.tanh(reset * cand)
