@@ -295,8 +295,8 @@ class DreamerV3:
         self.init_models()
         self.critic_target = TargetNetwork(self.critic, config.critic_tau)
         self.optim_wm = Adam(self.world_model.parameters(), config.wm_lr, eps=1e-5)
-        self.optim_actor = Adam(self.actor.parameters(), config.ac_lr, eps=1e-5)
-        self.optim_critic = Adam(self.critic.parameters(), config.ac_lr, eps=1e-5)
+        self.optim_actor = Adam(self.actor.parameters(), config.reinforce_lr, eps=1e-5)
+        self.optim_critic = Adam(self.critic.parameters(), config.reinforce_lr, eps=1e-5)
         
         act_dim = () if config.action_type == "discrete" else (config.action_dim,)
         if config.obs_type == "image":
@@ -320,22 +320,18 @@ class DreamerV3:
         self.gamma = config.gamma
         self.lambda_ = config.lambda_
         self.percentiles = config.percentiles
+        self.action_type = config.action_type
+        self.num_actions = config.action_dim
 
     def choose_action(self, obs, det=False):
-        transformed_obs = transform_obs(obs, self.is_image)
-        latent_prob = self.world_model.encoder(transformed_obs, self.active_hidden)
-        latent = Independent(OneHotCategoricalStraightThrough(latent_prob), 1).sample()
-        state = make_state(latent, self.active_hidden)
+        state, latent = self.obs_to_state(obs, self.active_hidden)
         action = self.actor.policy_fn(state, det)
         return action, latent
     
     def eval_action(self, obs, det=True, reset=False):
-        transformed_obs = transform_obs(obs, self.is_image)
         if reset:
             self.eval_hidden = self.world_model._get_hidden(1)
-        latent_prob = self.world_model.encoder(transformed_obs, self.eval_hidden)
-        latent = Independent(OneHotCategoricalStraightThrough(latent_prob), 1).sample()
-        state = make_state(latent, self.eval_hidden)
+        state, latent = self.obs_to_state(obs, self.eval_hidden)
         action = self.actor.policy_fn(state, det)
         self.eval_hidden = self.world_model.recurrent_step(self.eval_hidden, latent, action).detach()
         return to_numpy(action)
@@ -388,8 +384,8 @@ class DreamerV3:
         continues[0] = (1 - dones.flatten())
         
         with torch.amp.autocast(device_type='cuda'):
-            loss_critic, returns, values = self.train_critic(states, rewards, continues)
-            loss_actor, actor_ent = self.train_actor(returns, values, log_probs, entropy)
+            loss_critic, returns, values = self.reinforce_critic_loss(states, rewards, continues)
+            loss_actor, actor_ent = self.reinforce_actor_loss(returns, values, log_probs, entropy)
         
         self.optim_critic.zero_grad(set_to_none=True)
         loss_critic.backward()
@@ -405,7 +401,7 @@ class DreamerV3:
         loss_dict["loss/actor entropy"] = to_numpy(actor_ent)
         return to_numpy(loss_wm), to_numpy(loss_critic), to_numpy(loss_actor), loss_dict 
     
-    def train_actor(self, returns, values, action_log_probs, entropy):
+    def reinforce_actor_loss(self, returns, values, action_log_probs, entropy):
         range_ = torch.quantile(returns, 1 - self.percentiles) - torch.quantile(returns, self.percentiles)
         if self.range_ema is not None:
             self.range_ema =(range_ * self.return_range_tau + self.range_ema * (1 - self.return_range_tau)).detach()
@@ -417,7 +413,7 @@ class DreamerV3:
         actor_loss = actor_loss.mean()
         return actor_loss, entropy.mean()
     
-    def train_critic(self, states, rewards, continues):
+    def reinforce_critic_loss(self, states, rewards, continues):
         self.critic_target.update()
         values, value_logits = self.critic(states)
         value_target, _ = self.critic_target(states)
@@ -427,6 +423,15 @@ class DreamerV3:
         loss -= value_bins.log_prob(value_target.detach()[:-1], aggregate=False)
         loss = loss.mean()
         return loss, returns.detach(), values.detach()[:-1] # returning returns and values for the actor to reuse later
+    
+    def obs_to_state(self, obs, hidden=None):
+        if hidden is None:
+            hidden = self.world_model._get_hidden(obs.shape[0])
+        transformed_obs = transform_obs(obs, self.is_image)
+        latent_prob = self.world_model.encoder(transformed_obs, hidden)
+        latent = Independent(OneHotCategoricalStraightThrough(latent_prob), 1).sample()
+        state = make_state(latent, hidden)
+        return state, latent
         
     def checkpoint_models(self, folderpath, filename):
         torch.save(self.world_model.state_dict(), f"{folderpath}/world_model-{filename}.pth")

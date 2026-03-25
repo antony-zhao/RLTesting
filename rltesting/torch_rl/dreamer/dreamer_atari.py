@@ -2,9 +2,7 @@ import gymnasium as gym
 from rltesting.utils.logger import Logger
 from rltesting.torch_rl.dreamer.dreamer import *
 import ale_py
-from stable_baselines3.common.env_util import make_vec_env
-from stable_baselines3.common.vec_env import SubprocVecEnv
-from stable_baselines3.common.atari_wrappers import NoopResetEnv, FireResetEnv
+from ale_py.vector_env import AtariVectorEnv
 import argparse
 
 def parse_args():
@@ -50,9 +48,10 @@ def parse_args():
     parser.add_argument("--percentiles", default=0.05, type=float)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--wm_lr", default=8e-5, type=float)
-    parser.add_argument("--ac_lr", default=4e-5, type=float)
+    parser.add_argument("--reinforce_lr", default=4e-5, type=float)
     parser.add_argument("--num_envs", default=32, type=int)
     parser.add_argument("--replay_ratio", default=32, type=int) # batch_size * seq_len / timesteps_in_env = replay ratio, so default of 64 * 16 / num_envs * timesteps = 16
+    parser.add_argument("--total_steps", default=5_000_000, type=int)
     parser.add_argument("--env_id", default="Assault")
     config = parser.parse_args()
 
@@ -79,75 +78,108 @@ def parse_args():
     return config
 
 
-def make_env(config):
-    def thunk():
-        gym.register_envs(ale_py)
-        env = gym.make(f"ALE/{config.env_id}-v5", render_mode="rgb_array")
-        env = NoopResetEnv(env, noop_max=30)
-        env = FireResetEnv(env)
-        env = gym.wrappers.ResizeObservation(env, (64, 64))
-        env = gym.wrappers.TransformObservation(env, lambda x: x.transpose(2, 0, 1), observation_space=gym.spaces.Box(0, 255, config.image_dim))
-        env = gym.wrappers.TimeLimit(env, 10000)
-        env = gym.wrappers.RecordEpisodeStatistics(env)
-        return env
-    return thunk
+def make_env(config, num_envs):
+    # ALE vector env handles preprocessing natively in C++:
+    # frame skip, resize, noop reset, fire reset
+    # grayscale=False for RGB, stack_num=1 since RSSM handles temporal info
+    env = AtariVectorEnv(
+        game=config.env_id.lower(),
+        num_envs=num_envs,
+        frameskip=4,
+        grayscale=False,
+        stack_num=1,
+        img_height=config.image_size,
+        img_width=config.image_size,
+        noop_max=30,
+        use_fire_reset=True,
+        reward_clipping=False,
+        max_num_frames_per_episode=108000,  # 27000 steps * frameskip 4, standard for atari
+        repeat_action_probability=0.25,
+    )
+    env = gym.wrappers.vector.RecordEpisodeStatistics(env)
+    return env
+
+def process_obs(obs):
+    # ALE vec env with grayscale=False, stack_num=1 outputs (N, 1, H, W, 3)
+    # Dreamer expects (N, C, H, W)
+    if obs.ndim == 5:
+        obs = obs.squeeze(1)  # (N, H, W, 3)
+    return obs.transpose(0, 3, 1, 2)  # (N, 3, H, W)
+
+def make_eval_env(config):
+    gym.register_envs(ale_py)
+    env = gym.make(
+        f"ALE/{config.env_id}-v5",
+        render_mode="rgb_array",
+        frameskip=4,
+        repeat_action_probability=0.25,
+    )
+    env = gym.wrappers.ResizeObservation(env, (config.image_size, config.image_size))
+    env = gym.wrappers.TimeLimit(env, 27000)
+    return env
 
 def eval(dreamer, eval_env, config):
-    obs = eval_env.reset()
+    obs, _ = eval_env.reset()
+    obs = obs.transpose(2, 0, 1)[np.newaxis]  # (1, 3, H, W)
     is_first = True
     total_reward = 0
     frames = []
     obs_traj = []
     while True:
-        action = dreamer.eval_action(torch.tensor(obs).float().to(config.device), reset=is_first)
+        with torch.no_grad():
+            action = dreamer.eval_action(torch.tensor(obs).float().to(config.device), reset=is_first)
         is_first = False
-        obs, reward, done, infos = eval_env.step(action)
-        frames.append(eval_env.render())
-        obs_traj.append(obs)
-        if done[0]:
-            total_reward = infos[0]['episode']['r']
+        action = action.item() if np.ndim(action) > 0 else action
+        next_obs, reward, terminated, truncated, info = eval_env.step(action)
+        frames.append(eval_env.render())  # full resolution rgb_array
+        next_obs = next_obs.transpose(2, 0, 1)[np.newaxis]
+        obs_traj.append(next_obs)
+        total_reward += reward
+        if terminated or truncated:
             break
+        obs = next_obs
     return total_reward, obs_traj, frames
 
 def imagine_rollout(dreamer, eval_env, config):
-    obs = eval_env.reset()
+    obs, _ = eval_env.reset()
+    obs = obs.transpose(2, 0, 1)[np.newaxis]
     obs = torch.tensor(obs).float().to(config.device)
-    eval_hidden = dreamer.world_model._get_hidden(1)
-    latent_prob = dreamer.world_model.encoder(obs, eval_hidden)
-    latent = Independent(OneHotCategoricalStraightThrough(latent_prob), 1).sample()
-    state = make_state(latent, eval_hidden)
-    states = dreamer.imagine_rollout(state, 128)[0]
-    imagined_rollout = dreamer.world_model.decoder.from_state(states) + 0.5
+    with torch.no_grad():
+        eval_hidden = dreamer.world_model._get_hidden(1)
+        latent_prob = dreamer.world_model.encoder(obs, eval_hidden)
+        latent = Independent(OneHotCategoricalStraightThrough(latent_prob), 1).sample()
+        state = make_state(latent, eval_hidden)
+        states = dreamer.imagine_rollout(state, 128)[0]
+        imagined_rollout = dreamer.world_model.decoder.from_state(states) + 0.5
     return imagined_rollout.unsqueeze(0)
 
 if __name__ == "__main__":
     config = parse_args()
     num_envs = config.num_envs
-    env = make_vec_env(make_env(config), num_envs, vec_env_cls=SubprocVecEnv, vec_env_kwargs=dict(start_method='spawn'))
-    eval_env = make_vec_env(make_env(config), 1)
+    env = make_env(config, num_envs)
+    eval_env = make_eval_env(config)
     dreamer = DreamerV3(config)
     logger = Logger(f"logs/dreamer-v3/{config.env_id}")
 
-    losses_wm = []
-    losses_actor = []
-    losses_critic = []
-    losses_dict = {}
-    obs = env.reset()
+    obs, _ = env.reset()
+    obs = process_obs(obs)
     timestep = 0
-    for i in range(1, 5_000_000 // config.num_envs + 1):
+    num_iterations = config.total_steps // config.num_envs
+    for i in range(1, num_iterations + 1):
         timestep += config.num_envs
         if i % 100 == 0:
             print(i)
         with torch.no_grad():
             action, latent = dreamer.choose_action(torch.tensor(obs).float().to(config.device))
-        next_obs, reward, done, info = env.step(to_numpy(action))
+        next_obs, reward, terminated, truncated, infos = env.step(to_numpy(action))
+        next_obs = process_obs(next_obs)
+        done = terminated | truncated
         dreamer.process_sample(obs, latent, action, reward, done)
-        if True in done:
-            indices = np.where(done)[0]
-            temp_rew = []
-            for index in indices:
-                temp_rew.append(info[index]["episode"]["r"])
-            logger.add_scalar("rewards/train reward", np.mean(temp_rew))
+        # RecordEpisodeStatistics: infos["episode"] has r/l/t arrays, infos["_episode"] is boolean mask
+        if "_episode" in infos and np.any(infos["_episode"]):
+            finished = infos["_episode"]
+            episode_rewards = infos["episode"]["r"][finished]
+            logger.add_scalar("rewards/train reward", np.mean(episode_rewards))
             logger.write(timestep)
         if i % 1000 == 0 or i == 1:
             eval_reward, obs_traj, frames = eval(dreamer, eval_env, config)
@@ -163,4 +195,7 @@ if __name__ == "__main__":
             logger.add_metrics(loss_dict)
             logger.write(timestep)
         obs = next_obs
+ 
+    env.close()
+    eval_env.close()
     

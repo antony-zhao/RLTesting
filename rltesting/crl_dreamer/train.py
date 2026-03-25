@@ -80,8 +80,7 @@ def parse_args():
 
     # Optimizers
     parser.add_argument("--wm_lr", default=8e-5, type=float)
-    parser.add_argument("--actor_lr", default=4e-5, type=float)
-    parser.add_argument("--critic_lr", default=4e-5, type=float)
+    parser.add_argument("--reinforce_lr", default=4e-5, type=float)
     parser.add_argument("--contrastive_lr", default=3e-4, type=float)
     parser.add_argument("--alpha_lr", default=3e-4, type=float)
 

@@ -1,5 +1,5 @@
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
-ea = EventAccumulator('logs/dreamer_crl/2026-03-21-00-50-14/events.out.tfevents.1774075814.antony-B650-AORUS-ELITE-AX.155699.0')
+ea = EventAccumulator('logs/dreamer-v3/Assault/2026-03-23-18-15-43/events.out.tfevents.1774311343.antony-B650-AORUS-ELITE-AX.2444701.0')
 ea.Reload()
 for tag in sorted(ea.Tags()['scalars']):
     events = ea.Scalars(tag)

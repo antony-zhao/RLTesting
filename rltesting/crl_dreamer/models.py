@@ -1,7 +1,7 @@
 from rltesting.torch_rl.buffers import PerEnvTrajectoryBuffer
 from rltesting.torch_rl.contrastive_rl.crl import ScalingMLP, SafeTanhNormal
 from rltesting.torch_rl.dreamer.dreamer import (
-    DreamerWorldModel, Critic, WeightedAverageOverBins, 
+    DreamerWorldModel, Critic, WeightedAverageOverBins, DreamerV3,
     transform_obs, compute_lambda_returns, make_state, 
     init_weights, init_last_layer, unimix, probs_to_logits
 )
@@ -82,61 +82,23 @@ class ContrastiveCritic(nn.Module):
         logits = -torch.sqrt(torch.sum((sa_repr - g_repr) ** 2, dim=-1))
         return logits
 
-class DreamerCRL:
+class DreamerCRL(DreamerV3):
     def __init__(self, config, obs_to_goal=None):
-        self.config = config
-        self.device = config.device
-        self.world_model = DreamerWorldModel(config).to(self.device)
+        super().__init__(config)
         self.actor = PolicyModel(config).to(self.device)
-        self.critic = Critic(config, self.world_model.bins).to(self.device)
         self.contrastive_critic = ContrastiveCritic(config).to(self.device)
-        self.critic_target = TargetNetwork(self.critic, config.critic_tau)
         
-        self.optim_wm = Adam(self.world_model.parameters(), config.wm_lr, eps=1e-5)
-        self.optim_actor = Adam(self.actor.parameters(), config.actor_lr, eps=1e-5)
-        self.optim_critic = Adam(self.critic.parameters(), config.critic_lr, eps=1e-5)
         self.optim_contrastive_critic = Adam(self.contrastive_critic.parameters(), config.contrastive_lr, eps=1e-5)
         self.optim_contrastive_actor = Adam(self.actor.parameters(), config.contrastive_lr, eps=1e-5)
         self.log_alpha_crl = nn.Parameter(torch.tensor(-2.3).to(self.device))
         self.alpha_optim = Adam([self.log_alpha_crl], 3e-4)
         self.obs_to_goal = obs_to_goal
-        # self.init_models()
         
-        if config.obs_type == "image":
-            self.is_image = True
-            self.buffer = PerEnvTrajectoryBuffer(config.num_envs, buffer_size=1_000_000)
-        elif config.obs_type == "vector":
-            self.is_image = False
-            self.buffer = PerEnvTrajectoryBuffer(config.num_envs, buffer_size=1_000_000)
-        else:
-            raise NotImplemented
-        # buffer needs to account for order in episodes
-        self.active_hidden = torch.zeros(config.num_envs, config.hidden_state_size).to(self.device)
-        self.eval_hidden = torch.zeros(1, config.hidden_state_size).to(self.device)
-        # the history for the environment itself, keeping track of it in here since 
-        # it would be a bit weird to have this be in the main part of the program
+        self.buffer = PerEnvTrajectoryBuffer(config.num_envs, buffer_size=1_000_000)
         
-        self.range_ema = None
-        self.return_range_tau = config.return_range_tau
-        # Used for calculating the range of returns to help normalize the reinforce gradient
-        
-        self.target_entropy = -config.action_dim * 0.5 if config.action_type == "continuous" else 0.3 * np.log(config.action_dim)
-        self.gamma = config.gamma
-        self.lambda_ = config.lambda_
-        self.percentiles = config.percentiles
-        self.action_type = config.action_type
-        self.num_actions = config.action_dim
+        self.target_entropy = -config.action_dim * 0.5 if config.action_type == "continuous" else 0.5 * np.log(config.action_dim)
         self.use_alpha = config.use_alpha
         self.penalty = config.penalty
-
-    def obs_to_state(self, obs, hidden=None):
-        if hidden is None:
-            hidden = self.world_model._get_hidden(obs.shape[0])
-        transformed_obs = transform_obs(obs, self.is_image)
-        latent_prob = self.world_model.encoder(transformed_obs, hidden)
-        latent = Independent(OneHotCategoricalStraightThrough(latent_prob), 1).sample()
-        state = make_state(latent, hidden)
-        return state, latent
     
     def choose_action(self, obs, goal=None, det=False):
         state, latent = self.obs_to_contrastive_state(obs, self.active_hidden)
@@ -154,39 +116,6 @@ class DreamerCRL:
         action = self.actor.policy_fn(state, goal_state, det)
         self.eval_hidden = self.world_model.recurrent_step(self.eval_hidden, latent, action).detach()
         return to_numpy(action)
-    
-    def process_sample(self, obs, latent, action, reward, done):
-        # do a step in RSSM and store stuff in buffer
-        self.buffer.add_sample([obs, to_numpy(action), reward, done])
-
-        continue_ = torch.tensor(1 - done).unsqueeze(1).to(self.device)
-        self.active_hidden = (continue_ * self.world_model.recurrent_step(self.active_hidden, latent, action) +
-                              (1 - continue_) * self.world_model._get_hidden(self.config.num_envs)).detach()
-    
-    def imagine_rollout(self, state, steps=None):
-        states = []
-        actions = []
-        action_log_probs = []
-        action_entropies = []
-        rewards = []
-        continues = []
-        for _ in range(self.config.rollout_length if steps is None else steps):
-            action_dist = self.actor.policy_dist(state)
-            action = self.actor.sample_action(action_dist).detach()
-            action_prob = action_dist.log_prob(action)
-            action_log_probs.append(action_prob)
-            action_entropy = action_dist.entropy()
-            action_entropies.append(action_entropy)
-            if self.config.action_type == "discrete":
-                action = F.one_hot(action.long(), self.config.action_dim).float()
-            (next_latent, next_hidden), reward, continue_ = self.world_model.imagine_step(state[:, :self.config.latent_size], state[:, self.config.latent_size:], action)
-            states.append(state.detach())
-            actions.append(action.detach())
-            rewards.append(reward.detach())
-            continues.append(continue_.squeeze().detach())
-            state = torch.concatenate([next_latent.flatten(-2), next_hidden], 1)
-        states.append(state.detach())
-        return torch.stack(states), torch.stack(rewards), torch.stack(continues), torch.stack(action_log_probs), torch.stack(action_entropies)
     
     def train(self):
         sample, future_obs, _ = self.buffer.sample_with_goals_as_tensors(self.config.device, self.config.sample_batch_size, self.config.sample_seq_len)
@@ -234,17 +163,6 @@ class DreamerCRL:
                         self.optim_contrastive_critic.zero_grad()
                         loss_critic.backward()
                         self.optim_contrastive_critic.step()
-            
-            # states, rewards, continues, log_probs, entropy = self.imagine_rollout(new_states.reshape(-1, self.config.state_size))
-            # continues[0] = (1 - dones.flatten())
-                
-            # loss_critic_ac, returns, values = self.train_critic(states, rewards, continues)
-            # loss_actor_ac, actor_ent = self.train_actor(returns, values, log_probs, entropy)
-            
-            # self.alpha_optim.zero_grad()
-            # alpha_loss = self.alpha_loss(crl_states, goal_latents)
-            # alpha_loss.backward()
-            # self.alpha_optim.step()
         
             # # Buffer-based CRL for extra critic/actor updates
             for _ in range(self.config.crl_steps_per_train):
@@ -303,29 +221,6 @@ class DreamerCRL:
         c_critic_loss, c_critic_metrics = self.contrastive_critic_loss(states, actions, future_states)
         critic_loss = r_critic_loss + c_critic_loss
         return critic_loss, returns, values, c_critic_metrics
-    
-    def reinforce_actor_loss(self, returns, values, action_log_probs, entropy):
-        range_ = torch.quantile(returns, 1 - self.percentiles) - torch.quantile(returns, self.percentiles)
-        if self.range_ema is not None:
-            self.range_ema = range_ * self.return_range_tau + self.range_ema * (1 - self.return_range_tau)
-        else:
-            self.range_ema = range_
-        
-        adv = ((returns - values) / torch.clip(self.range_ema, min=1)).detach()
-        actor_loss = -(adv * action_log_probs + entropy * self.config.entropy_coef)
-        actor_loss = actor_loss.mean()
-        return actor_loss, entropy.mean()
-    
-    def reinforce_critic_loss(self, states, rewards, continues):
-        self.critic_target.update()
-        values, value_logits = self.critic(states)
-        value_target, _ = self.critic_target(states)
-        returns = compute_lambda_returns(values, rewards, continues, self.gamma, self.lambda_)
-        value_bins = WeightedAverageOverBins(self.world_model.bins, value_logits[:-1])
-        loss = -value_bins.log_prob(returns.detach(), aggregate=False)
-        loss -= value_bins.log_prob(value_target.detach()[:-1], aggregate=False)
-        loss = loss.mean()
-        return loss, returns.detach(), values.detach()[:-1] # returning returns and values for the actor to reuse later
         
     def contrastive_actor_loss(self, states, goal_latents, obs, future_obs):
         states = torch.cat([states, states], dim=0)
@@ -386,29 +281,8 @@ class DreamerCRL:
         return (alpha_loss).mean()
     
     def checkpoint_models(self, folderpath, filename):
-        torch.save(self.world_model.state_dict(), f"{folderpath}/world_model-{filename}.pth")
-        torch.save(self.actor.state_dict(), f"{folderpath}/actor-{filename}.pth")
-        torch.save(self.critic.state_dict(), f"{folderpath}/critic-{filename}.pth")
-        self.buffer.save(f"{folderpath}/buffer_{filename}.npz")
-    
-    def init_models(self):
-        self.critic.apply(init_weights)
-        self.actor.apply(init_weights)
-        self.world_model.reward_predictor.apply(init_weights)
-        self.world_model.continue_predictor.apply(init_weights)
-        self.world_model.dynamics_predictor.apply(init_weights)
-        self.world_model.encoder.apply(init_weights)
-        self.world_model.decoder.apply(init_weights)
-        self.world_model.rssm.apply(init_weights)
-        
-        init_last_layer(self.critic, nn.init.zeros_)
-        init_last_layer(self.world_model.reward_predictor, nn.init.zeros_)
-        init_last_layer(self.actor, nn.init.xavier_uniform_)
-        init_last_layer(self.world_model.continue_predictor, nn.init.xavier_uniform_)
-        init_last_layer(self.world_model.dynamics_predictor, nn.init.xavier_uniform_)
-        init_last_layer(self.world_model.encoder, nn.init.xavier_uniform_)
-        init_last_layer(self.world_model.decoder, nn.init.xavier_uniform_)
-        init_last_layer(self.world_model.rssm, nn.init.xavier_uniform_)
+        super().checkpoint_models(folderpath, filename)
+        torch.save(self.contrastive_critic.state_dict(), f"{folderpath}/contrastive_critic-{filename}.pth")
     
     def extract_crl_pairs(self, states, actions, dones, obs):
         B, T, D = states.shape
