@@ -49,9 +49,11 @@ def parse_args():
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--wm_lr", default=8e-5, type=float)
     parser.add_argument("--reinforce_lr", default=4e-5, type=float)
-    parser.add_argument("--num_envs", default=32, type=int)
-    parser.add_argument("--replay_ratio", default=32, type=int) # batch_size * seq_len / timesteps_in_env = replay ratio, so default of 64 * 16 / num_envs * timesteps = 16
-    parser.add_argument("--total_steps", default=5_000_000, type=int)
+    parser.add_argument("--num_envs", default=16, type=int)
+    parser.add_argument("--replay_ratio", default=32, type=int) # batch_size * seq_len / timesteps_in_env = replay ratio, so default of 64 * 16 / num_envs * timesteps = 32
+    parser.add_argument("--total_steps", default=50_000_000, type=int)
+    parser.add_argument("--train_wm_after", default=10_000, type=int)
+    parser.add_argument("--train_reinforce_after", default=100_000, type=int)
     parser.add_argument("--env_id", default="Assault")
     config = parser.parse_args()
 
@@ -189,9 +191,9 @@ if __name__ == "__main__":
             imagined_rollout = imagine_rollout(dreamer, eval_env, config)
             logger.add_video("videos/imagined rollout", imagined_rollout, fps=120)
             logger.write(timestep)
-        if i > 500 and i % config.train_every == 0:
+        if timestep > config.train_wm_after and i % config.train_every == 0:
             for _ in range(config.num_iters):
-                loss_wm, loss_critic, loss_actor, loss_dict = dreamer.train()
+                loss_dict = dreamer.train()
             logger.add_metrics(loss_dict)
             logger.write(timestep)
         obs = next_obs

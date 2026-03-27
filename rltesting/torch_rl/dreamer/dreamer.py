@@ -380,6 +380,9 @@ class DreamerV3:
         torch.nn.utils.clip_grad_norm_(self.world_model.parameters(), 5)
         self.optim_wm.step()
         
+        if self.buffer.size < self.config.train_reinforce_after:
+            return loss_dict
+        
         states, rewards, continues, log_probs, entropy = self.imagine_rollout(new_states.reshape(-1, self.config.state_size))
         continues[0] = (1 - dones.flatten())
         
@@ -399,7 +402,7 @@ class DreamerV3:
         loss_dict["loss/actor loss"] = to_numpy(loss_actor)
         loss_dict["loss/critic loss"] = to_numpy(loss_critic)
         loss_dict["loss/actor entropy"] = to_numpy(actor_ent)
-        return to_numpy(loss_wm), to_numpy(loss_critic), to_numpy(loss_actor), loss_dict 
+        return loss_dict 
     
     def reinforce_actor_loss(self, returns, values, action_log_probs, entropy):
         range_ = torch.quantile(returns, 1 - self.percentiles) - torch.quantile(returns, self.percentiles)
