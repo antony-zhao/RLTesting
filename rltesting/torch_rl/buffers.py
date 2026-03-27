@@ -41,7 +41,7 @@ class ReplayBuffer:
         self.buffers = []
         self.index = 0
         self.buffer_size = buffer_size
-        self.total = 0
+        self.size = 0
         self.done_index = done_index
         self.weights = SumTree(buffer_size) if prioritized else None
         self.initialized = False
@@ -70,8 +70,8 @@ class ReplayBuffer:
     
     def sample_indices(self, batch_size, seq_len=1):
         if self.weights is None:
-            if self.total < self.buffer_size:
-                indices = np.random.randint(0, min(self.total - seq_len, self.buffer_size), size=batch_size)
+            if self.size < self.buffer_size:
+                indices = np.random.randint(0, min(self.size - seq_len, self.buffer_size), size=batch_size)
             else:
                 idx = np.random.randint(0, self.buffer_size - seq_len, size=batch_size)
                 idx = (self.index + idx) % self.buffer_size
@@ -99,7 +99,7 @@ class ReplayBuffer:
         for i, buffer in enumerate(self.buffers):
             buffer[self.index] = sample[i]
         self.index = (self.index + 1) % self.buffer_size
-        self.total += 1
+        self.size += 1
     
     def add_samples(self, data_samples):
         # used mainly for adding full episodes but can also handle small rollouts
@@ -109,7 +109,7 @@ class ReplayBuffer:
         for i, buffer in enumerate(self.buffers):
             buffer[indices] = data_samples[i]
         self.index = (self.index + num_steps) % self.buffer_size
-        self.total += num_steps
+        self.size += num_steps
     
     def modify_indices(self, buffer_num, indices, data):
         # might not be needed for this but would be good for prioritized replay or dreamerv3
@@ -121,7 +121,7 @@ class ReplayBuffer:
     def get_state(self):
         state = {
             'index': self.index,
-            'total': self.total,
+            'total': self.size,
             'weights': self.weights if self.weights is not None else np.array([])
         }
 
@@ -135,7 +135,7 @@ class ReplayBuffer:
         
     def set_state(self, state):
         self.index = int(state['index'])
-        self.total = int(state['total'])
+        self.size = int(state['total'])
         self.weights = state['weights'] if state['weights'].size > 0 else None
         
         for i in range(len(self.buffers)):
@@ -157,7 +157,7 @@ class TrajectoryReplayBuffer(ReplayBuffer):
         self.trajectory_ends = {}
     
     def add_sample(self, sample):
-        if self.total >= self.buffer_size:
+        if self.size >= self.buffer_size:
             old_traj_idx = self.indices[self.index, 0]
             if self.trajectory_ends.get(old_traj_idx) == self.index:
                 self.trajectory_ends.pop(old_traj_idx, None)
@@ -177,7 +177,7 @@ class TrajectoryReplayBuffer(ReplayBuffer):
         num_steps = data_samples[0].shape[0]
         write_indices = (self.index + np.arange(num_steps)) % self.buffer_size
         
-        if self.total >= self.buffer_size:
+        if self.size >= self.buffer_size:
             old_traj_ids = self.indices[write_indices, 0]
             for i in range(num_steps):
                 old_id = old_traj_ids[i]
