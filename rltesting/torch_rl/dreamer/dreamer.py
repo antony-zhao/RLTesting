@@ -234,7 +234,7 @@ class DreamerWorldModel(nn.Module):
         latent_enc = Independent(OneHotCategoricalStraightThrough(probs_enc), 1)
         latent_dyn = Independent(OneHotCategoricalStraightThrough(probs_dyn.detach()), 1)
         kl_div = kl_divergence(latent_enc, latent_dyn)
-        return torch.clip(kl_div, min=self.config.free_nats).mean() 
+        return torch.clip(kl_div, min=self.config.free_nats).mean()
           
 class Actor(nn.Module):
     def __init__(self, config):
