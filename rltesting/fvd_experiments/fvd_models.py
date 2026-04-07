@@ -45,7 +45,7 @@ class DecoderConv(nn.Module):
         return self.layers(x)
 
 class Encoder(nn.Module):
-    def __init__(self, framestack, latent_dim, image_dim, image_channels=3, filter_base=8):
+    def __init__(self, framestack, latent_dim, image_dim, image_channels=3, filter_base=4):
         super().__init__()
         self.conv = EncoderConv(filter_base=filter_base, image_channels=image_channels * framestack, input_size=image_dim) # 256, 4x4
         self.conv_dim = self.conv.output_size
@@ -58,7 +58,7 @@ class Encoder(nn.Module):
         return x
 
 class Decoder(nn.Module):
-    def __init__(self, conv_dim, framestack, latent_dim, image_channels=3, filter_base=8):
+    def __init__(self, conv_dim, framestack, latent_dim, image_channels=3, filter_base=4):
         super().__init__()
         self._in = nn.Linear(latent_dim, np.prod(conv_dim))
         self.conv_dim = conv_dim
@@ -71,7 +71,7 @@ class Decoder(nn.Module):
         return x
 
 class DoubleAutoEncoder(nn.Module):
-    def __init__(self, encoder, decoder, latent_dim, intrinsic_dim, hidden_dim=256):
+    def __init__(self, encoder, decoder, latent_dim, intrinsic_dim, hidden_dim=128):
         super().__init__()
         self.encoder = encoder
         self.decoder = decoder
@@ -103,17 +103,17 @@ class DoubleAutoEncoder(nn.Module):
     
     def reconstruction_loss(self, image):
         latent = self.compute_latent(image)
-        intrinsic = self.compute_intrinsic(latent.detach())
+        intrinsic = self.compute_intrinsic(latent)
         latent_reconstruction = self.reconstruct_latent(intrinsic)
         reconstruction = self.reconstruct_image(latent)
-        return F.mse_loss(image, reconstruction) + F.mse_loss(latent.detach(), latent_reconstruction)
+        return F.mse_loss(image, reconstruction) #+ F.mse_loss(latent.detach(), latent_reconstruction)
 
 class AEVAE(DoubleAutoEncoder):
-    def __init__(self, encoder, decoder, latent_dim, intrinsic_dim, hidden_dim=256, penalty_coef=1e-4):
+    def __init__(self, encoder, decoder, latent_dim, intrinsic_dim, hidden_dim=128, penalty_coef=1e-4):
         super().__init__(encoder, decoder, latent_dim, intrinsic_dim, hidden_dim)
         # treat intrinsic_encoder as producing the mean
         self.penalty_coef = penalty_coef
-        self.intrinsic_encoder = MLP(latent_dim, latent_dim, hidden_dim, act=nn.GELU, skip_connections=False)
+        self.intrinsic_encoder = MLP(latent_dim, latent_dim, hidden_dim, num_hiddens=2, act=nn.GELU, skip_connections=False)
         self.intrinsic_decoder = MLP(intrinsic_dim, latent_dim, hidden_dim, num_hiddens=0, act=nn.GELU, skip_connections=False)
         self.intrinsic_mu = nn.Linear(latent_dim, intrinsic_dim)
         self.intrinsic_logvar = nn.Linear(latent_dim, intrinsic_dim)
