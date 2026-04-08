@@ -45,7 +45,7 @@ class DecoderConv(nn.Module):
         return self.layers(x)
 
 class Encoder(nn.Module):
-    def __init__(self, framestack, latent_dim, image_dim, image_channels=3, filter_base=4):
+    def __init__(self, framestack, latent_dim, image_dim, image_channels=3, filter_base=16):
         super().__init__()
         self.conv = EncoderConv(filter_base=filter_base, image_channels=image_channels * framestack, input_size=image_dim) # 256, 4x4
         self.conv_dim = self.conv.output_size
@@ -58,7 +58,7 @@ class Encoder(nn.Module):
         return x
 
 class Decoder(nn.Module):
-    def __init__(self, conv_dim, framestack, latent_dim, image_channels=3, filter_base=4):
+    def __init__(self, conv_dim, framestack, latent_dim, image_channels=3, filter_base=16):
         super().__init__()
         self._in = nn.Linear(latent_dim, np.prod(conv_dim))
         self.conv_dim = conv_dim
