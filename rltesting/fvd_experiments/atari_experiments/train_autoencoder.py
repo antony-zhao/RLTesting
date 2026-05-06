@@ -19,7 +19,7 @@ import torch.nn.functional as F
 import skdim
 from matplotlib import pyplot as plt
 
-from config import get_config, make_env, add_env_arg, to_numpy
+from config import get_config, make_env, add_env_arg, to_numpy, env_path
 from rltesting.fvd_experiments.fvd_models import (
     Encoder, Decoder, DoubleAutoEncoder, IMPALAEncoder, IMPALADecoder
 )
@@ -74,7 +74,7 @@ def collect_data(env, cfg):
     dtypes = [np.uint8, np.float32, np.float32, np.float32]
     buffer = ReplayBuffer(buffer_shapes, dtypes, buffer_size=cfg['data_steps'])
 
-    filepath = f"{cfg['env_name']}_buffer.npz"
+    filepath = env_path(cfg, "buffer.npz")
     if os.path.isfile(filepath):
         print(f"Loading buffer from {filepath}")
         buffer.load(filepath)
@@ -139,7 +139,7 @@ def train_stage1(encoder, decoder, buffer, cfg, use_weighted_loss=False):
     plt.title('Stage 1 Loss')
     plt.xlabel('Step')
     plt.ylabel('MSE')
-    plt.savefig(f"{cfg['env_name']}_stage1_loss.png")
+    plt.savefig(env_path(cfg, "stage1_loss.png"))
     plt.close()
     return losses
 
@@ -232,7 +232,7 @@ def train_stage1_with_forward(encoder, decoder, forward_model, buffer, cfg,
     for ax in axes:
         ax.set_xlabel('Step')
     plt.tight_layout()
-    plt.savefig(f"{cfg['env_name']}_stage1_fwd_loss.png")
+    plt.savefig(env_path(cfg, "stage1_fwd_loss.png"))
     plt.close()
     return recon_losses, dyn_losses
 
@@ -288,7 +288,7 @@ def train_stage2(model, buffer, cfg, use_weighted_loss=False):
     plt.title('Stage 2 Loss')
     plt.xlabel('Step')
     plt.ylabel('MSE')
-    plt.savefig(f"{cfg['env_name']}_stage2_loss.png")
+    plt.savefig(env_path(cfg, "stage2_loss.png"))
     plt.close()
     return losses
 
@@ -361,7 +361,7 @@ def train_stage2_with_forward(model, forward_model, buffer, cfg,
     for ax in axes:
         ax.set_xlabel('Step')
     plt.tight_layout()
-    plt.savefig(f"{cfg['env_name']}_stage2_fwd_loss.png")
+    plt.savefig(env_path(cfg, "stage2_fwd_loss.png"))
     plt.close()
     return recon_losses, dyn_losses
 
@@ -378,18 +378,23 @@ def visualize_reconstructions(model, buffer, cfg, n=4, stage='stage2'):
             recon = model.double_decode(intrinsic)
 
     fig, axs = plt.subplots(n, 2, figsize=(4, 2 * n))
+    img_ch = cfg.get('image_channels', 3)
     for i in range(n):
-        orig = to_numpy(obs[i].transpose(-3, -1))[:, :, :3]
-        rec = to_numpy(recon[i].transpose(-3, -1))[:, :, :3]
-        axs[i][0].imshow(orig)
+        orig = to_numpy(obs[i].transpose(-3, -1))
+        rec = to_numpy(recon[i].transpose(-3, -1))
+        if img_ch == 1:
+            axs[i][0].imshow(orig[:, :, 0], cmap='gray')
+            axs[i][1].imshow(rec[:, :, 0], cmap='gray')
+        else:
+            axs[i][0].imshow(orig[:, :, :3])
+            axs[i][1].imshow(rec[:, :, :3])
         axs[i][0].set_title('Original' if i == 0 else '')
         axs[i][0].axis('off')
-        axs[i][1].imshow(rec)
         title = 'Stage 1 Recon' if stage == 'stage1' else 'Double AE Recon'
         axs[i][1].set_title(title if i == 0 else '')
         axs[i][1].axis('off')
     plt.tight_layout()
-    fname = f"{cfg['env_name']}_{stage}_reconstructions.png"
+    fname = env_path(cfg, f"{stage}_reconstructions.png")
     plt.savefig(fname)
     plt.close()
     print(f"Saved {stage} reconstructions to {fname}")
@@ -397,7 +402,7 @@ def visualize_reconstructions(model, buffer, cfg, n=4, stage='stage2'):
 
 def save_checkpoint(model, intrinsic_dim, cfg, forward_model=None):
     """Save the trained model."""
-    path = f"{cfg['env_name']}_autoencoder.pt"
+    path = env_path(cfg, "autoencoder.pt")
     data = {
         'weights': model.state_dict(),
         'intrinsic_dim': intrinsic_dim,
@@ -436,7 +441,7 @@ def main():
     args = parser.parse_args()
 
     cfg = get_config(args.env)
-    ckpt_path = f"{cfg['env_name']}_autoencoder.pt"
+    ckpt_path = env_path(cfg, "autoencoder.pt")
 
     if os.path.isfile(ckpt_path) and not args.force:
         print(f"Checkpoint {ckpt_path} already exists. Use --force to retrain.")
@@ -445,7 +450,9 @@ def main():
     np.random.seed(42)
     torch.manual_seed(0)
 
-    env = make_env(cfg)
+    use_weighted = args.weighted_loss or cfg.get('weighted_loss', False)
+
+    env = make_env(cfg, mode='pixels')
 
     import time
     t0 = time.time()
@@ -490,11 +497,11 @@ def main():
         train_stage1_with_forward(encoder, decoder, forward_model, buffer, cfg,
                                    fp_coef=args.fp_coef,
                                    pred_coef=args.pred_coef,
-                                   use_weighted_loss=args.weighted_loss,
+                                   use_weighted_loss=use_weighted,
                                    split_gradients=not args.direct_grads)
     else:
         train_stage1(encoder, decoder, buffer, cfg,
-                     use_weighted_loss=args.weighted_loss)
+                     use_weighted_loss=use_weighted)
     t_stage1 = time.time() - t0
     print(f"  Stage 1 training: {t_stage1:.1f}s")
 
@@ -512,6 +519,13 @@ def main():
     model = DoubleAutoEncoder(encoder, decoder, cfg['latent_dim'],
                               intrinsic_dim, hidden_dim=cfg['hidden_dim']).cuda()
 
+    total_params = sum(p.numel() for p in model.parameters())
+    intrinsic_params = (sum(p.numel() for p in model.intrinsic_encoder.parameters())
+                        + sum(p.numel() for p in model.intrinsic_decoder.parameters()))
+    print(f"\n=== Model Summary ===")
+    print(f"  Intrinsic MLP: {intrinsic_params:,} params")
+    print(f"  Total:         {total_params:,} params")
+
     # Visualize stage 1 before stage 2 training changes anything
     visualize_reconstructions(model, buffer, cfg, stage='stage1')
 
@@ -523,9 +537,9 @@ def main():
         train_stage2_with_forward(model, intrinsic_forward_model, buffer, cfg,
                                    fp_coef=args.fp_coef,
                                    pred_coef=args.pred_coef,
-                                   use_weighted_loss=args.weighted_loss)
+                                   use_weighted_loss=use_weighted)
     else:
-        train_stage2(model, buffer, cfg, use_weighted_loss=args.weighted_loss)
+        train_stage2(model, buffer, cfg, use_weighted_loss=use_weighted)
     t_stage2 = time.time() - t0
     print(f"  Stage 2 training: {t_stage2:.1f}s")
 
@@ -534,7 +548,7 @@ def main():
     # Save
     save_checkpoint(model, intrinsic_dim, cfg, forward_model=forward_model)
     if intrinsic_forward_model is not None:
-        fwd_path = f"{cfg['env_name']}_intrinsic_forward.pt"
+        fwd_path = env_path(cfg, "intrinsic_forward.pt")
         torch.save(intrinsic_forward_model.state_dict(), fwd_path)
         print(f"Saved intrinsic forward model to {fwd_path}")
 

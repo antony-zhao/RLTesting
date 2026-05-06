@@ -22,7 +22,7 @@ to_numpy = lambda x: x.cpu().detach().numpy()
 # ---- Config ---- #
 framestack = 2
 obs_shape = 64
-latent_dim = 512
+latent_dim = None
 aevae_path = 'boxing_aevae.pt'
 lam = 0.9
 gamma = 0.99
@@ -56,8 +56,8 @@ print("Loading AEVAE...")
 ckpt = torch.load(aevae_path, weights_only=False)
 intrinsic_dim = ckpt['intrinsic_dim']
 latent_dim = ckpt['latent_dim']
-encoder = Encoder(framestack, latent_dim, obs_shape).cuda()
-decoder = Decoder(encoder.conv_dim, framestack, latent_dim).cuda()
+encoder = Encoder(framestack, latent_dim, obs_shape, filter_base=16).cuda()
+decoder = Decoder(encoder.conv_dim, framestack, latent_dim, filter_base=16).cuda()
 aevae = AEVAE(encoder, decoder, latent_dim, intrinsic_dim).cuda()
 aevae.load_state_dict(ckpt['weights'])
 aevae.eval()

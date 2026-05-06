@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
-from rltesting.torch_rl.models import MLP, ChannelNorm
+from rltesting.torch_rl.models import MLP, ChannelNorm, IMPALABlock, ResBlock
 import numpy as np
 
 def compute_pad(kernel_size, stride):
@@ -49,23 +49,33 @@ class Encoder(nn.Module):
         super().__init__()
         self.conv = EncoderConv(filter_base=filter_base, image_channels=image_channels * framestack, input_size=image_dim) # 256, 4x4
         self.conv_dim = self.conv.output_size
-        self.out = nn.Linear(np.prod(self.conv.output_size), latent_dim)
+        if latent_dim is None:
+            self.out = None
+            self.latent_dim = self.conv_dim
+        else:
+            self.out = nn.Linear(np.prod(self.conv.output_size), latent_dim)
+            self.latent_dim = latent_dim
     
     def forward(self, x):
         x = self.conv(x)
         x = x.flatten(-3)
-        x = self.out(x)
+        if self.out:
+            x = self.out(x)
         return x
 
 class Decoder(nn.Module):
     def __init__(self, conv_dim, framestack, latent_dim, image_channels=3, filter_base=16):
         super().__init__()
-        self._in = nn.Linear(latent_dim, np.prod(conv_dim))
+        if latent_dim is None:
+            self._in = None
+        else:
+            self._in = nn.Linear(latent_dim, np.prod(conv_dim))
         self.conv_dim = conv_dim
         self.conv = DecoderConv(filter_base=filter_base, image_channels=image_channels * framestack)
     
     def forward(self, x):
-        x = self._in(x)
+        if self._in:
+            x = self._in(x)
         x = x.reshape(-1, *self.conv_dim)
         x = self.conv(x)
         return x
@@ -75,8 +85,10 @@ class DoubleAutoEncoder(nn.Module):
         super().__init__()
         self.encoder = encoder
         self.decoder = decoder
-        self.intrinsic_encoder = MLP(latent_dim, intrinsic_dim, hidden_dim, act=nn.GELU, skip_connections=False)
-        self.intrinsic_decoder = MLP(intrinsic_dim, latent_dim, hidden_dim, act=nn.GELU, skip_connections=False)
+        self.latent_dim = np.prod(encoder.latent_dim) if latent_dim is None else latent_dim
+        
+        self.intrinsic_encoder = MLP(self.latent_dim, intrinsic_dim, hidden_dim, act=nn.GELU, skip_connections=True)
+        self.intrinsic_decoder = MLP(intrinsic_dim, self.latent_dim, hidden_dim, act=nn.GELU, skip_connections=True)
         self.intrinsic_dim = intrinsic_dim
     
     def double_encode(self, image):
@@ -113,10 +125,10 @@ class AEVAE(DoubleAutoEncoder):
         super().__init__(encoder, decoder, latent_dim, intrinsic_dim, hidden_dim)
         # treat intrinsic_encoder as producing the mean
         self.penalty_coef = penalty_coef
-        self.intrinsic_encoder = MLP(latent_dim, latent_dim, hidden_dim, num_hiddens=2, act=nn.GELU, skip_connections=False)
-        self.intrinsic_decoder = MLP(intrinsic_dim, latent_dim, hidden_dim, num_hiddens=0, act=nn.GELU, skip_connections=False)
-        self.intrinsic_mu = nn.Linear(latent_dim, intrinsic_dim)
-        self.intrinsic_logvar = nn.Linear(latent_dim, intrinsic_dim)
+        self.intrinsic_encoder = MLP(self.latent_dim, hidden_dim, hidden_dim, num_hiddens=2, act=nn.GELU, skip_connections=False)
+        self.intrinsic_decoder = MLP(intrinsic_dim, self.latent_dim, hidden_dim, num_hiddens=0, act=nn.GELU, skip_connections=False)
+        self.intrinsic_mu = nn.Linear(hidden_dim, intrinsic_dim)
+        self.intrinsic_logvar = nn.Linear(hidden_dim, intrinsic_dim)
     
     def double_encode(self, image):
         latent = self.encoder(image)
@@ -165,7 +177,6 @@ class HybridAEVAE(AEVAE):
         latent_q = self.codes(codebook_ind)
         latent_q_straight_through = latent + (latent_q - latent).detach()
         return latent_q_straight_through, latent_q
-        
     
     def double_encode(self, image):
         latent = self.encoder(image)
@@ -234,3 +245,94 @@ def distance_correlation_loss(z, c):
 
     dcov2 = torch.sum(A * B) / (n * (n - 3))
     return dcov2
+
+class IMPALADecoderBlock(nn.Module):
+    """Reverse of IMPALABlock: ResBlocks → Upsample → Conv."""
+    def __init__(self, in_channels, out_channels, act=nn.GELU):
+        super().__init__()
+        self.res1 = ResBlock(in_channels, in_channels, 3, act)
+        self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+ 
+    def forward(self, x):
+        x = self.res1(x)
+        x = self.upsample(x)
+        x = self.conv(x)
+        return x
+ 
+ 
+class IMPALAEncoder(nn.Module):
+    """IMPALA-style encoder. Drop-in replacement for Encoder.
+ 
+    Uses IMPALABlock (Conv → MaxPool → ResBlock → ResBlock) at each level.
+    MaxPool downsamples more gently than strided conv, preserving small features.
+    Residual connections improve gradient flow through the network.
+ 
+    Works with any even input size (64, 80, 96, 128, etc).
+    """
+    def __init__(self, framestack, latent_dim, image_dim, image_channels=3,
+                 filter_base=16, num_blocks=4, act=nn.GELU):
+        super().__init__()
+        in_channels = image_channels * framestack
+        channels = [in_channels] + [filter_base * 2 ** i for i in range(num_blocks)]
+ 
+        self.blocks = nn.Sequential(
+            *[IMPALABlock(channels[i], channels[i + 1], act, num_blocks=1) for i in range(num_blocks)]
+        )
+        self.final_act = act()
+ 
+        # Compute output spatial size after num_blocks MaxPool(3, stride=2, pad=1)
+        size = image_dim
+        for _ in range(num_blocks):
+            size = (size - 1) // 2 + 1  # MaxPool2d(3, stride=2, padding=1) formula
+        self.conv_dim = (channels[-1], size, size)
+ 
+        if latent_dim is None:
+            self.out = None
+            self.latent_dim = self.conv_dim
+        else:
+            self.out = nn.Linear(int(np.prod(self.conv_dim)), latent_dim)
+            self.latent_dim = latent_dim
+ 
+    def forward(self, x):
+        x = self.blocks(x)
+        x = self.final_act(x)
+        x = x.flatten(-3)
+        if self.out:
+            x = self.out(x)
+        return x
+ 
+ 
+class IMPALADecoder(nn.Module):
+    """IMPALA-style decoder (reverse of IMPALAEncoder). Drop-in replacement for Decoder.
+ 
+    Uses IMPALADecoderBlock (ResBlock → ResBlock → Upsample → Conv) at each level.
+    Final output is passed through sigmoid to [0, 1].
+ 
+    Works with any even input size (64, 80, 96, 128, etc).
+    """
+    def __init__(self, conv_dim, framestack, latent_dim, image_channels=3,
+                 filter_base=16, num_blocks=4, act=nn.GELU):
+        super().__init__()
+        if latent_dim is None:
+            self._in = None
+        else:
+            self._in = nn.Linear(latent_dim, int(np.prod(conv_dim)))
+        self.conv_dim = conv_dim
+ 
+        # Channels: high → low → output image channels
+        channels = [filter_base * 2 ** i for i in reversed(range(num_blocks))]
+        out_channels = channels[1:] + [image_channels * framestack]
+ 
+        self.blocks = nn.Sequential(
+            *[IMPALADecoderBlock(channels[i], out_channels[i], act) for i in range(num_blocks)]
+        )
+        self.sigmoid = nn.Sigmoid()
+ 
+    def forward(self, x):
+        if self._in:
+            x = self._in(x)
+        x = x.reshape(-1, *self.conv_dim)
+        x = self.blocks(x)
+        x = self.sigmoid(x)
+        return x

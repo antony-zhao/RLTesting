@@ -20,7 +20,7 @@ from stable_baselines3.common.atari_wrappers import AtariWrapper
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import BaseCallback
 
-from config import get_config, add_env_arg, ENVS
+from config import get_config, add_env_arg, ENVS, env_path
 
 gym.register_envs(ale_py)
 
@@ -40,20 +40,35 @@ class RewardLogger(BaseCallback):
         return True
 
 
-def make_pixel_env(env_id):
-    """Create a single pixel-observation Atari environment."""
+def make_pixel_env(env_id, env_type='atari'):
+    """Create a single pixel-observation environment."""
     def _init():
-        env = gym.make(env_id, render_mode='rgb_array')
+        if env_type == 'atari':
+            env = gym.make(env_id, render_mode='rgb_array')
+            env = AtariWrapper(env)
+        else:
+            from rltesting.fvd_experiments.wrapper import BasicEnvironmentRGB
+            from gymnasium.wrappers import ResizeObservation, TransformObservation
+            import numpy as np
+            env = gym.make(env_id, render_mode='rgb_array')
+            env = BasicEnvironmentRGB(env)
+            env = ResizeObservation(env, (84, 84))
+            # Grayscale for SB3 compatibility (VecFrameStack + VecTransposeImage needs ≤4 channels)
+            env = TransformObservation(
+                env, lambda o: np.dot(o[..., :3], [0.299, 0.587, 0.114])[..., None].astype(np.uint8),
+                observation_space=gym.spaces.Box(0, 255, (84, 84, 1), dtype=np.uint8))
         env = Monitor(env)
-        env = AtariWrapper(env)
         return env
     return _init
 
 
-def make_ram_env(env_id):
-    """Create a single RAM-observation Atari environment."""
+def make_ram_env(env_id, env_type='atari'):
+    """Create a single RAM/state-observation environment."""
     def _init():
-        env = gym.make(env_id, obs_type='ram', render_mode='rgb_array')
+        if env_type == 'atari':
+            env = gym.make(env_id, obs_type='ram', render_mode='rgb_array')
+        else:
+            env = gym.make(env_id, render_mode='rgb_array')
         env = Monitor(env)
         return env
     return _init
@@ -64,7 +79,8 @@ def train_pixels(cfg):
     print(f"\n=== PPO (Pixels) — {cfg['env_name'].title()} ===")
 
     n_envs = cfg['ppo_n_envs']
-    env = SubprocVecEnv([make_pixel_env(cfg['env_id']) for _ in range(n_envs)])
+    env_type = cfg.get('env_type', 'atari')
+    env = SubprocVecEnv([make_pixel_env(cfg['env_id'], env_type) for _ in range(n_envs)])
     env = VecFrameStack(env, n_stack=4)
     env = VecTransposeImage(env)
 
@@ -95,7 +111,8 @@ def train_ram(cfg):
     print(f"\n=== PPO (RAM) — {cfg['env_name'].title()} ===")
 
     n_envs = cfg['ppo_n_envs']
-    env = SubprocVecEnv([make_ram_env(cfg['env_id']) for _ in range(n_envs)])
+    env_type = cfg.get('env_type', 'atari')
+    env = SubprocVecEnv([make_ram_env(cfg['env_id'], env_type) for _ in range(n_envs)])
 
     model = PPO(
         'MlpPolicy', env,
@@ -121,13 +138,14 @@ def train_ram(cfg):
 def evaluate(model, cfg, mode, n_episodes=100):
     """Evaluate a trained model."""
     print(f"\nEvaluating for {n_episodes} episodes...")
+    env_type = cfg.get('env_type', 'atari')
 
     if mode == 'pixels':
-        eval_env = SubprocVecEnv([make_pixel_env(cfg['env_id'])])
+        eval_env = SubprocVecEnv([make_pixel_env(cfg['env_id'], env_type)])
         eval_env = VecFrameStack(eval_env, n_stack=4)
         eval_env = VecTransposeImage(eval_env)
     else:
-        eval_env = SubprocVecEnv([make_ram_env(cfg['env_id'])])
+        eval_env = SubprocVecEnv([make_ram_env(cfg['env_id'], env_type)])
 
     eval_returns = []
     for _ in range(n_episodes):
@@ -161,7 +179,7 @@ def save_results(logger, eval_returns, cfg, mode):
         plt.ylabel('Return')
         plt.title(f"PPO ({mode}) — {cfg['env_name'].title()}")
         plt.legend()
-        plt.savefig(f"ppo_{mode}_{cfg['env_name']}.png")
+        plt.savefig(env_path(cfg, f"ppo_{mode}.png"))
         plt.close()
 
     # JSON
@@ -176,7 +194,7 @@ def save_results(logger, eval_returns, cfg, mode):
         'total_timesteps': cfg['ppo_timesteps'],
         'last_100_avg': float(np.mean(logger.episode_returns[-100:])),
     }
-    save_path = f"ppo_{mode}_{cfg['env_name']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    save_path = env_path(cfg, f"ppo_{mode}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
     with open(save_path, 'w') as f:
         json.dump(results, f, indent=2)
     print(f"Saved to {save_path}")

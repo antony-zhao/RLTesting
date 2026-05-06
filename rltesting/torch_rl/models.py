@@ -92,19 +92,17 @@ class NatureCNN(nn.Module):
             return x
 
 class IMPALABlock(nn.Module):
-    def __init__(self, in_channels, out_channels, act=nn.GELU):
+    def __init__(self, in_channels, out_channels, act=nn.GELU, num_blocks=2):
         super().__init__()
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
         self.pool1 = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-        self.res1 = ResBlock(out_channels, out_channels, 3, act)
-        self.res2 = ResBlock(out_channels, out_channels, 3, act)
+        self.res = nn.Sequential(*[ResBlock(out_channels, out_channels, 3, act) for _ in range(num_blocks)])
         self.act = act()
         
     def forward(self, x):
         x = self.conv1(x)
         x = self.pool1(x)
-        x = self.res1(x)
-        x = self.res2(x)
+        x = self.res(x)
         return x
 
 class IMPALACNN(nn.Module):

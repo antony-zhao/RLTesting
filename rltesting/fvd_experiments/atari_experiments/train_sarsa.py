@@ -1,8 +1,14 @@
 """
-SARSA(λ) with hashed tile coding on learned representations.
+SARSA(λ) with hashed tile coding.
 
-Usage: python train_sarsa.py --env boxing
-       python train_sarsa.py --env boxing --finetune
+Supports two modes:
+  - pixels: learned representation from autoencoder (Atari, or classic control with --mode pixels)
+  - raw:    tile coding directly on state vector (classic control)
+
+Usage: python train_sarsa.py --env boxing                    # Atari (pixels, needs autoencoder)
+       python train_sarsa.py --env cartpole --mode raw       # classic control on raw state
+       python train_sarsa.py --env acrobot --mode pixels     # classic control on pixels
+       python train_sarsa.py --env boxing --finetune-once
 """
 import argparse
 import copy
@@ -17,7 +23,7 @@ import torch
 import torch.nn.functional as F
 from matplotlib import pyplot as plt
 
-from config import get_config, make_env, add_env_arg, to_numpy
+from config import get_config, make_env, add_env_arg, to_numpy, env_path
 from rltesting.fvd_experiments.fvd_models import (
     Encoder, Decoder, DoubleAutoEncoder, IMPALAEncoder, IMPALADecoder
 )
@@ -26,7 +32,7 @@ from rltesting.fvd_experiments.tiles import tiles
 
 def load_autoencoder(cfg):
     """Load a trained autoencoder checkpoint."""
-    path = f"{cfg['env_name']}_autoencoder.pt"
+    path = env_path(cfg, "autoencoder.pt")
     if not os.path.isfile(path):
         raise FileNotFoundError(f"No checkpoint at {path}. Run train_autoencoder.py first.")
 
@@ -134,6 +140,9 @@ def finetune_model(model, recent_episodes, ft_opt, steps=50, batch_size=256):
 def main():
     parser = argparse.ArgumentParser(description='SARSA(λ) with hashed tile coding')
     add_env_arg(parser)
+    parser.add_argument('--mode', type=str, default=None, choices=['raw', 'pixels'],
+                        help='raw=tile code on state vector, pixels=use autoencoder. '
+                             'Default: raw for classic control, pixels for atari')
     parser.add_argument('--finetune', action='store_true', help='Enable delayed fine-tuning')
     parser.add_argument('--finetune-once', action='store_true',
                         help='Fine-tune once at finetune_at episode, then resume SARSA')
@@ -141,6 +150,15 @@ def main():
     args = parser.parse_args()
 
     cfg = get_config(args.env)
+
+    # Determine mode
+    if args.mode is not None:
+        mode = args.mode
+    elif cfg.get('env_type') == 'classic':
+        mode = 'raw'
+    else:
+        mode = 'pixels'
+
     if args.finetune:
         cfg['finetune'] = True
     if args.finetune_once:
@@ -151,8 +169,133 @@ def main():
     np.random.seed(42)
     torch.manual_seed(0)
 
-    # Setup
-    env = make_env(cfg)
+    if mode == 'raw':
+        _run_raw(cfg)
+    else:
+        _run_pixels(cfg)
+
+
+def _run_raw(cfg):
+    """SARSA(λ) with tile coding directly on raw state vector."""
+    env = make_env(cfg, mode='raw')
+    num_actions = env.action_space.n
+    state_dim = cfg.get('state_dim', env.observation_space.shape[0])
+
+    # Tile coding setup
+    hash_size = cfg['hash_size']
+    num_tilings = cfg['num_tilings']
+    num_tiles_per_dim = cfg['num_tiles_per_dim']
+    alpha = cfg['alpha']
+    lam = cfg['lam']
+    gamma = cfg['gamma']
+
+    w = np.zeros(hash_size)
+
+    # Scaling: map observation bounds to tile grid
+    obs_low = env.observation_space.low
+    obs_high = env.observation_space.high
+    # Clip infinite bounds to reasonable range
+    obs_low = np.clip(obs_low, -10.0, None)
+    obs_high = np.clip(obs_high, None, 10.0)
+    obs_range = obs_high - obs_low
+    obs_range[obs_range == 0] = 1.0
+    scale = np.full(state_dim, num_tiles_per_dim) / obs_range
+
+    def get_tiles(state, action):
+        scaled = ((state - obs_low) * scale).tolist()
+        return tiles(hash_size, num_tilings, scaled, ints=[action])
+
+    def Q_all(state):
+        qs = np.zeros(num_actions)
+        for a in range(num_actions):
+            qs[a] = np.sum(w[get_tiles(state, a)])
+        return qs
+
+    def pick_action(state, eps):
+        if np.random.random() < eps:
+            return np.random.randint(num_actions)
+        return np.argmax(Q_all(state))
+
+    print(f"\n=== SARSA(λ) Raw State: {cfg['env_name']} ===")
+    print(f"  state_dim={state_dim}, tilings={num_tilings}, "
+          f"tiles_per_dim={num_tiles_per_dim}, hash_size={hash_size}")
+    print(f"  alpha={alpha:.5f}, lambda={lam}, gamma={gamma}")
+
+    returns = []
+    timestep_checkpoints = []
+    total_steps = 0
+    ep = 0
+    t_start = time.time()
+
+    while total_steps < cfg['sarsa_max_timesteps'] and ep < cfg['sarsa_max_episodes']:
+        epsilon = max(cfg['epsilon_min'], 1.0 - ep / cfg['epsilon_decay_episodes'])
+
+        obs, _ = env.reset()
+        S = np.array(obs, dtype=np.float64)
+        A = pick_action(S, epsilon)
+
+        trace_indices = set()
+        e = np.zeros(hash_size)
+        ep_reward = 0
+
+        while True:
+            obs_next, R, terminated, truncated, _ = env.step(A)
+            done = terminated or truncated
+            total_steps += 1
+            ep_reward += R
+
+            active = get_tiles(S, A)
+            q_sa = np.sum(w[active])
+
+            if done:
+                td_error = R - q_sa
+            else:
+                S_next = np.array(obs_next, dtype=np.float64)
+                A_next = pick_action(S_next, epsilon)
+                q_next = np.sum(w[get_tiles(S_next, A_next)])
+                td_error = R + gamma * q_next - q_sa
+
+            # Decay traces
+            if trace_indices:
+                trace_list = np.array(list(trace_indices))
+                e[trace_list] *= gamma * lam
+                dead = trace_list[np.abs(e[trace_list]) < 1e-4]
+                e[dead] = 0.0
+                trace_indices -= set(dead)
+
+            # Replacing traces
+            for i in active:
+                e[i] = 1.0
+                trace_indices.add(i)
+
+            # Update
+            if trace_indices:
+                trace_list = np.array(list(trace_indices))
+                w[trace_list] += alpha * td_error * e[trace_list]
+
+            if done:
+                break
+            S = S_next
+            A = A_next
+
+        returns.append(ep_reward)
+        timestep_checkpoints.append(total_steps)
+        ep += 1
+
+        if ep % 25 == 0:
+            elapsed = time.time() - t_start
+            avg = np.mean(returns[-25:])
+            print(f"Steps: {total_steps:>8d} | Ep {ep:4d} | "
+                  f"Avg(25): {avg:7.1f} | Eps: {epsilon:.3f} | "
+                  f"Time: {elapsed:.0f}s")
+
+    _save_and_plot(cfg, returns, timestep_checkpoints, total_steps, mode='raw')
+
+
+def _run_pixels(cfg):
+    """SARSA(λ) with tile coding on learned intrinsic representation."""
+    env_mode = 'pixels' if cfg.get('env_type') == 'classic' else 'default'
+    env = make_env(cfg, mode=env_mode)
     num_actions = env.action_space.n
     model, intrinsic_dim = load_autoencoder(cfg)
     model = copy.deepcopy(model)
@@ -197,7 +340,7 @@ def main():
 
     # Training loop
     ft_mode = 'ONCE' if cfg.get('finetune_once') else ('ON' if cfg['finetune'] else 'OFF')
-    print(f"\n=== SARSA(λ) Training: {cfg['env_name']} ===")
+    print(f"\n=== SARSA(λ) Pixels: {cfg['env_name']} ===")
     print(f"  intrinsic_dim={intrinsic_dim}, tilings={num_tilings}, "
           f"tiles_per_dim={num_tiles_per_dim}, hash_size={hash_size}")
     print(f"  alpha={alpha:.5f}, lambda={lam}, gamma={gamma}")
@@ -347,7 +490,13 @@ def main():
                   f"Avg(25): {avg:7.1f} | Eps: {epsilon:.3f} | "
                   f"Time: {elapsed:.0f}s{ft_str}")
 
-    # Plot
+    _save_and_plot(cfg, returns, timestep_checkpoints, total_steps, mode='pixels',
+                   intrinsic_dim=intrinsic_dim)
+
+
+def _save_and_plot(cfg, returns, timestep_checkpoints, total_steps,
+                   mode='pixels', intrinsic_dim=None):
+    """Shared save and plot logic for both modes."""
     window = 25
     smoothed = np.convolve(returns, np.ones(window) / window, mode='valid')
     smoothed_steps = timestep_checkpoints[window - 1:]
@@ -355,26 +504,17 @@ def main():
     plt.figure(figsize=(10, 6))
     plt.plot(timestep_checkpoints, returns, alpha=0.3, label='Raw')
     plt.plot(smoothed_steps, smoothed, label=f'{window}-ep avg')
-    if cfg.get('finetune_once') and finetune_once_done:
-        ft_idx = min(cfg['finetune_once_at'], len(timestep_checkpoints) - 1)
-        ft_step = timestep_checkpoints[ft_idx]
-        plt.axvline(ft_step, color='green', linestyle='--', alpha=0.7, label='Fine-tune point')
-    elif cfg['finetune']:
-        ft_s = timestep_checkpoints[min(cfg['finetune_start'], len(timestep_checkpoints) - 1)]
-        ft_e = timestep_checkpoints[min(cfg['finetune_end'], len(timestep_checkpoints) - 1)]
-        plt.axvspan(ft_s, ft_e, alpha=0.1, color='green', label='Fine-tune window')
     plt.xlabel('Timesteps')
     plt.ylabel('Return')
-    plt.title(f"SARSA(λ) + Tile Coding — {cfg['env_name'].title()}")
+    mode_label = 'Raw State' if mode == 'raw' else 'Learned Repr'
+    plt.title(f"SARSA(λ) + Tile Coding ({mode_label}) — {cfg['env_name'].title()}")
     plt.legend()
-    plt.savefig(f"sarsa_{cfg['env_name']}.png")
+    plt.savefig(env_path(cfg, f"sarsa_{mode}.png"))
     plt.close()
 
-    # Save results
-    total_time = time_collect + time_encode + time_sarsa + time_finetune
     results = {
         'env': cfg['env_name'],
-        'intrinsic_dim': intrinsic_dim,
+        'mode': mode,
         'returns': [float(r) for r in returns],
         'timesteps': [int(t) for t in timestep_checkpoints],
         'final_avg_25': float(np.mean(returns[-25:])),
@@ -382,22 +522,18 @@ def main():
         'total_steps': total_steps,
         'config': {k: v for k, v in cfg.items() if isinstance(v, (int, float, str, bool))},
     }
-    save_path = f"sarsa_{cfg['env_name']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    if intrinsic_dim is not None:
+        results['intrinsic_dim'] = intrinsic_dim
+
+    save_path = env_path(cfg, f"sarsa_{mode}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
     with open(save_path, 'w') as f:
         json.dump(results, f, indent=2)
 
-    print(f"\n=== Results ===")
+    print(f"\n=== Results ({mode}) ===")
     print(f"Final avg (last 25):  {np.mean(returns[-25:]):.1f}")
     if len(returns) >= 100:
         print(f"Final avg (last 100): {np.mean(returns[-100:]):.1f}")
-    print(f"\n=== Timing ===")
-    if total_time > 0:
-        print(f"Collect:  {time_collect:7.1f}s ({100 * time_collect / total_time:.0f}%)")
-        print(f"Encode:   {time_encode:7.1f}s ({100 * time_encode / total_time:.0f}%)")
-        print(f"SARSA:    {time_sarsa:7.1f}s ({100 * time_sarsa / total_time:.0f}%)")
-        if cfg['finetune']:
-            print(f"Finetune: {time_finetune:7.1f}s ({100 * time_finetune / total_time:.0f}%)")
-    print(f"\nSaved to {save_path}")
+    print(f"Saved to {save_path}")
 
 
 if __name__ == '__main__':

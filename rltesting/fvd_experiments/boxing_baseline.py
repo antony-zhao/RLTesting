@@ -10,8 +10,10 @@ from stable_baselines3.common.vec_env import SubprocVecEnv, VecFrameStack, VecTr
 from stable_baselines3.common.atari_wrappers import AtariWrapper
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.utils import get_linear_fn
 import json
 from datetime import datetime
+from matplotlib import pyplot as plt
 
 gym.register_envs(ale_py)
 
@@ -30,7 +32,7 @@ class RewardLogger(BaseCallback):
 
 def make_env():
     def _init():
-        env = gym.make('ALE/Boxing-v5', render_mode='rgb_array')
+        env = gym.make('ALE/Boxing-v5', render_mode='rgb_array', repeat_action_probability=0.0)
         env = AtariWrapper(env)
         env = Monitor(env)
         return env
@@ -43,19 +45,25 @@ if __name__ == "__main__":
     env = VecFrameStack(env, n_stack=4)
     env = VecTransposeImage(env)
 
-    total_timesteps = 5_000_000
+    total_timesteps = 10_000_000
+
+    policy_kwargs = dict(
+        share_features_extractor=False
+    )
 
     model = PPO('CnnPolicy', env, verbose=1,
                 n_steps=128,
                 batch_size=256,
-                n_epochs=4,
-                learning_rate=2.5e-4,
+                n_epochs=3,                    # was 4
+                learning_rate=lambda f: f * 2.5e-4,  # linear anneal
                 gamma=0.99,
-                gae_lambda=0.97,
-                clip_range=0.2,
+                gae_lambda=0.95,               # was 0.97
+                clip_range=lambda f: f * 0.1,  # linear anneal from 0.1
                 ent_coef=0.01,
-                vf_coef=0.5,
-                max_grad_norm=0.5)
+                vf_coef=1.0,                   # was 0.5
+                max_grad_norm=0.5,
+                policy_kwargs=policy_kwargs
+                )
 
     logger = RewardLogger()
     model.learn(total_timesteps=total_timesteps, callback=logger)
@@ -92,7 +100,22 @@ if __name__ == "__main__":
         'training_timesteps': [int(t) for t in logger.episode_timesteps],
         'total_timesteps': total_timesteps
     }
-
+    
+    # Plot training curve
+    window = 100
+    if len(logger.episode_returns) > window:
+        smoothed = np.convolve(logger.episode_returns, np.ones(window)/window, mode='valid')
+        smoothed_steps = logger.episode_timesteps[window-1:]
+        plt.figure(figsize=(10, 6))
+        plt.plot(logger.episode_timesteps, logger.episode_returns, alpha=0.3, label='Raw')
+        plt.plot(smoothed_steps, smoothed, label=f'{window}-ep avg')
+        plt.xlabel('Timesteps'); plt.ylabel('Return')
+        plt.title('PPO (SB3) - Boxing @ 5M steps')
+        plt.legend()
+        plt.savefig('ppo_boxing.png')
+        plt.close()
+        print("Saved plot to ppo_boxing.png")
+    
     save_path = f"ppo_boxing_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     with open(save_path, 'w') as f:
         json.dump(results, f, indent=2)
