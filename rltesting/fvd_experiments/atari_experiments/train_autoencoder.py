@@ -30,12 +30,13 @@ from rltesting.torch_rl.buffers import ReplayBuffer
 # ---- Forward prediction model ---- #
 
 class ForwardPredictor(nn.Module):
-    """Predicts z_{t+1} from (z_t, a_t). Action is one-hot concatenated."""
-    def __init__(self, latent_dim, num_actions, hidden_dim=256):
+    """Predicts z_{t+1} from (z_t, a_t). Supports discrete (one-hot) and continuous actions."""
+    def __init__(self, latent_dim, action_size, hidden_dim=256, discrete=True):
         super().__init__()
-        self.num_actions = num_actions
+        self.discrete = discrete
+        self.action_size = action_size
         self.net = nn.Sequential(
-            nn.Linear(latent_dim + num_actions, hidden_dim),
+            nn.Linear(latent_dim + action_size, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
@@ -45,12 +46,42 @@ class ForwardPredictor(nn.Module):
     def forward(self, z, action):
         """
         z: (B, latent_dim) — current latent
-        action: (B,) — integer actions
+        action: (B,) int for discrete, (B, action_dim) float for continuous
         Returns: (B, latent_dim) — predicted next latent
         """
-        a_onehot = F.one_hot(action.long(), self.num_actions).float()
-        x = torch.cat([z, a_onehot], dim=-1)
+        if self.discrete:
+            a = F.one_hot(action.long(), self.action_size).float()
+        else:
+            a = action.float()
+            if a.dim() == 1:
+                a = a.unsqueeze(-1)
+        x = torch.cat([z, a], dim=-1)
         return self.net(x)
+
+
+class RewardPredictor(nn.Module):
+    """Predicts reward from (z_t, a_t). Supports discrete and continuous actions."""
+    def __init__(self, latent_dim, action_size, hidden_dim=128, discrete=True):
+        super().__init__()
+        self.discrete = discrete
+        self.action_size = action_size
+        self.net = nn.Sequential(
+            nn.Linear(latent_dim + action_size, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, z, action):
+        if self.discrete:
+            a = F.one_hot(action.long(), self.action_size).float()
+        else:
+            a = action.float()
+            if a.dim() == 1:
+                a = a.unsqueeze(-1)
+        x = torch.cat([z, a], dim=-1)
+        return self.net(x).squeeze(-1)
 
 
 def weighted_reconstruction_loss(reconstruction, target, bg_weight=1.0, fg_weight=10.0):
@@ -70,7 +101,9 @@ def weighted_reconstruction_loss(reconstruction, target, bg_weight=1.0, fg_weigh
 def collect_data(env, cfg):
     """Collect random-policy data into a replay buffer."""
     img_ch = cfg.get('image_channels', 3)
-    buffer_shapes = [(cfg['obs_shape'], cfg['obs_shape'], img_ch * cfg['framestack']), (), (), ()]
+    action_shape = env.action_space.shape  # () for discrete, (2,) for LunarLander continuous
+    buffer_shapes = [(cfg['obs_shape'], cfg['obs_shape'], img_ch * cfg['framestack']),
+                     action_shape, (), ()]
     dtypes = [np.uint8, np.float32, np.float32, np.float32]
     buffer = ReplayBuffer(buffer_shapes, dtypes, buffer_size=cfg['data_steps'])
 
@@ -95,12 +128,18 @@ def prep_batch(buffer, batch_size):
     return obs
 
 
-def prep_transition_batch(buffer, batch_size):
+def prep_transition_batch(buffer, batch_size, discrete_actions=True, include_rewards=False):
     """Sample consecutive (obs_t, action_t, obs_{t+1}) pairs using buffer's seq_len."""
     samples = buffer.sample(batch_size, seq_len=2)
     obs_t = (torch.tensor(samples[0][:, 0]).float().transpose(-3, -1) / 255).cuda()
-    actions = torch.tensor(samples[1][:, 0]).long().cuda()
+    if discrete_actions:
+        actions = torch.tensor(samples[1][:, 0]).long().cuda()
+    else:
+        actions = torch.tensor(samples[1][:, 0]).float().cuda()
     obs_tp1 = (torch.tensor(samples[0][:, 1]).float().transpose(-3, -1) / 255).cuda()
+    if include_rewards:
+        rewards = torch.tensor(samples[2][:, 0]).float().cuda()
+        return obs_t, actions, obs_tp1, rewards
     return obs_t, actions, obs_tp1
 
 
@@ -145,90 +184,117 @@ def train_stage1(encoder, decoder, buffer, cfg, use_weighted_loss=False):
 
 
 def train_stage1_with_forward(encoder, decoder, forward_model, buffer, cfg,
-                               fp_coef=0.5, pred_coef=0.1,
+                               fp_coef=0.5, pred_coef=0.1, reward_coef=0.5,
+                               reward_model=None,
                                use_weighted_loss=False, split_gradients=True):
-    """Train conv autoencoder with forward prediction auxiliary loss.
-
-    Two modes controlled by split_gradients:
+    """Train conv autoencoder with forward prediction and optional reward prediction.
 
     split_gradients=True (DreamerV3-style, default):
       - Dynamics loss:        train forward model only (encoder detached)
       - Predictability loss:  train encoder only (forward model detached)
-      Encoder is mostly driven by reconstruction with a gentle nudge
-      toward predictability. Avoids collapsing the latent space.
 
     split_gradients=False (direct):
       - Forward loss flows directly through z_t into the encoder.
-      Simpler but can degrade reconstruction quality.
+
+    Reward prediction (if reward_model provided):
+      - Predict reward from (z_t, a_t), gradients flow through encoder.
     """
     mode = "split (DreamerV3-style)" if split_gradients else "direct"
-    print(f"\n=== Stage 1: Conv AE + Forward Prediction ({mode}) ===")
-    print(f"  fp_coef={fp_coef}, pred_coef={pred_coef}")
+    print(f"\n=== Stage 1: Conv AE + Forward/Reward Prediction ({mode}) ===")
+    print(f"  fp_coef={fp_coef}, pred_coef={pred_coef}, reward_coef={reward_coef}")
+    print(f"  forward_model={'yes' if forward_model is not None else 'no'}")
+    print(f"  reward_model={'yes' if reward_model is not None else 'no'}")
 
-    all_params = (list(encoder.parameters()) + list(decoder.parameters())
-                  + list(forward_model.parameters()))
+    all_params = list(encoder.parameters()) + list(decoder.parameters())
+    if forward_model is not None:
+        all_params += list(forward_model.parameters())
+    if reward_model is not None:
+        all_params += list(reward_model.parameters())
     opt = torch.optim.Adam(all_params, cfg['ae_lr'])
     scheduler = torch.optim.lr_scheduler.ExponentialLR(opt, gamma=cfg['ae_scheduler_gamma'])
 
-    recon_losses, dyn_losses, pred_losses = [], [], []
+    discrete = cfg.get('_discrete_actions', True)
+    include_rewards = reward_model is not None
+
+    recon_losses, dyn_losses, pred_losses, reward_losses = [], [], [], []
     for epoch in range(1, cfg['stage1_epochs'] + 1):
         for _ in range(cfg['stage1_steps_per_epoch']):
-            # Sample transitions — use obs_t for reconstruction too
-            obs_t, actions, obs_tp1 = prep_transition_batch(buffer, cfg['batch_size'])
+            # Sample transitions
+            batch = prep_transition_batch(buffer, cfg['batch_size'], discrete, include_rewards=include_rewards)
+            if include_rewards:
+                obs_t, actions, obs_tp1, rewards = batch
+            else:
+                obs_t, actions, obs_tp1 = batch
 
-            # Two encoder passes total (z_t and z_tp1)
+            # Two encoder passes
             z_t = encoder(obs_t)
             z_tp1 = encoder(obs_tp1)
 
-            # Reconstruction from z_t
-            reconstruction = decoder(z_t)
+            # Reconstruction from both frames
+            recon_t = decoder(z_t)
+            recon_tp1 = decoder(z_tp1)
             if use_weighted_loss:
-                loss_recon = weighted_reconstruction_loss(reconstruction, obs_t)
+                loss_recon = (weighted_reconstruction_loss(recon_t, obs_t)
+                              + weighted_reconstruction_loss(recon_tp1, obs_tp1)) / 2
             else:
-                loss_recon = F.mse_loss(reconstruction, obs_t)
+                loss_recon = (F.mse_loss(recon_t, obs_t)
+                              + F.mse_loss(recon_tp1, obs_tp1)) / 2
+
+            loss = loss_recon
 
             # Forward prediction
-            if split_gradients:
-                # Dynamics: train forward model only
-                z_tp1_pred = forward_model(z_t.detach(), actions)
-                loss_dyn = F.mse_loss(z_tp1_pred, z_tp1.detach())
+            if forward_model is not None:
+                if split_gradients:
+                    z_tp1_pred = forward_model(z_t.detach(), actions)
+                    loss_dyn = F.mse_loss(z_tp1_pred, z_tp1.detach())
+                    loss_pred = F.mse_loss(z_tp1, z_tp1_pred.detach())
+                    loss = loss + fp_coef * loss_dyn + pred_coef * loss_pred
+                else:
+                    with torch.no_grad():
+                        z_tp1_target = z_tp1.detach()
+                    z_tp1_pred = forward_model(z_t, actions)
+                    loss_dyn = F.mse_loss(z_tp1_pred, z_tp1_target)
+                    loss_pred = torch.tensor(0.0)
+                    loss = loss + fp_coef * loss_dyn
+                dyn_losses.append(loss_dyn.item())
+                pred_losses.append(loss_pred.item() if split_gradients else 0.0)
 
-                # Predictability: train encoder only (through z_tp1)
-                loss_pred = F.mse_loss(z_tp1, z_tp1_pred.detach())
+            # Reward prediction: gradients flow through encoder
+            if reward_model is not None:
+                reward_pred = reward_model(z_t, actions)
+                loss_reward = F.mse_loss(reward_pred, rewards)
+                loss = loss + reward_coef * loss_reward
+                reward_losses.append(loss_reward.item())
 
-                loss_fwd = fp_coef * loss_dyn + pred_coef * loss_pred
-            else:
-                with torch.no_grad():
-                    z_tp1_target = z_tp1.detach()
-                z_tp1_pred = forward_model(z_t, actions)
-                loss_dyn = F.mse_loss(z_tp1_pred, z_tp1_target)
-                loss_pred = torch.tensor(0.0)
-                loss_fwd = fp_coef * loss_dyn
-
-            loss = loss_recon + loss_fwd
             loss.backward()
             opt.step()
             opt.zero_grad()
 
             recon_losses.append(loss_recon.item())
-            dyn_losses.append(loss_dyn.item())
-            pred_losses.append(loss_pred.item() if split_gradients else 0.0)
 
         scheduler.step()
         if epoch % 10 == 0:
             spe = cfg['stage1_steps_per_epoch']
             log = (f"  Epoch {epoch}/{cfg['stage1_epochs']} | "
-                   f"Recon: {np.mean(recon_losses[-spe:]):.5f} | "
-                   f"Dynamics: {np.mean(dyn_losses[-spe:]):.5f}")
-            if split_gradients:
-                log += f" | Predict: {np.mean(pred_losses[-spe:]):.5f}"
+                   f"Recon: {np.mean(recon_losses[-spe:]):.5f}")
+            if dyn_losses:
+                log += f" | Dyn: {np.mean(dyn_losses[-spe:]):.5f}"
+            if pred_losses and split_gradients:
+                log += f" | Pred: {np.mean(pred_losses[-spe:]):.5f}"
+            if reward_losses:
+                log += f" | Reward: {np.mean(reward_losses[-spe:]):.5f}"
             print(log)
 
-    fig, axes = plt.subplots(1, 3 if split_gradients else 2, figsize=(16, 4))
-    axes[0].plot(recon_losses); axes[0].set_title('Reconstruction Loss')
-    axes[1].plot(dyn_losses); axes[1].set_title('Dynamics Loss')
-    if split_gradients:
-        axes[2].plot(pred_losses); axes[2].set_title('Predictability Loss')
+    n_plots = 1 + bool(dyn_losses) + bool(reward_losses)
+    fig, axes = plt.subplots(1, n_plots, figsize=(5 * n_plots, 4))
+    if n_plots == 1:
+        axes = [axes]
+    idx = 0
+    axes[idx].plot(recon_losses); axes[idx].set_title('Reconstruction Loss'); idx += 1
+    if dyn_losses:
+        axes[idx].plot(dyn_losses); axes[idx].set_title('Dynamics Loss'); idx += 1
+    if reward_losses:
+        axes[idx].plot(reward_losses); axes[idx].set_title('Reward Loss'); idx += 1
     for ax in axes:
         ax.set_xlabel('Step')
     plt.tight_layout()
@@ -294,70 +360,105 @@ def train_stage2(model, buffer, cfg, use_weighted_loss=False):
 
 
 def train_stage2_with_forward(model, forward_model, buffer, cfg,
-                               fp_coef=0.5, pred_coef=0.1,
+                               fp_coef=0.5, pred_coef=0.1, reward_coef=0.5,
+                               reward_model=None,
                                use_weighted_loss=False):
-    """Train DoubleAutoEncoder with forward prediction in intrinsic space.
+    """Train DoubleAutoEncoder with forward prediction and optional reward prediction.
 
     DreamerV3-style split gradients:
       - Dynamics loss:       train forward model to predict next intrinsic (encoder detached)
       - Predictability loss: nudge encoder to produce predictable intrinsics (forward model detached)
+      - Reward loss:         predict reward from (z_t, a_t) — gradients flow through encoder
       - Reconstruction loss: main training signal for the full autoencoder
-
-    The forward model operates on the compact intrinsic space, making it
-    fast and focused on control-relevant dynamics.
     """
-    print(f"\n=== Stage 2: Double AE + Intrinsic Forward Prediction ===")
-    print(f"  fp_coef={fp_coef}, pred_coef={pred_coef}")
+    print(f"\n=== Stage 2: Double AE + Forward/Reward Prediction (fine-tune) ===")
+    print(f"  fp_coef={fp_coef}, pred_coef={pred_coef}, reward_coef={reward_coef}")
+    print(f"  reward_model={'yes' if reward_model is not None else 'no'}")
 
-    all_params = list(model.parameters()) + list(forward_model.parameters())
+    all_params = list(model.parameters())
+    if forward_model is not None:
+        all_params += list(forward_model.parameters())
+    if reward_model is not None:
+        all_params += list(reward_model.parameters())
     opt = torch.optim.AdamW(all_params, cfg['ae_lr'])
     scheduler = torch.optim.lr_scheduler.ExponentialLR(opt, gamma=cfg['ae_scheduler_gamma'])
 
-    recon_losses, dyn_losses, pred_losses = [], [], []
+    include_rewards = reward_model is not None
+    discrete = cfg.get('_discrete_actions', True)
+
+    recon_losses, dyn_losses, pred_losses, reward_losses = [], [], [], []
     for epoch in range(1, cfg['stage2_epochs'] + 1):
         for _ in range(cfg['stage2_steps_per_epoch']):
             # Sample transitions
-            obs_t, actions, obs_tp1 = prep_transition_batch(buffer, cfg['batch_size'])
+            batch = prep_transition_batch(buffer, cfg['batch_size'], discrete, include_rewards=include_rewards)
+            if include_rewards:
+                obs_t, actions, obs_tp1, rewards = batch
+            else:
+                obs_t, actions, obs_tp1 = batch
 
             # Encode both frames to intrinsic space
             z_t = model.double_encode(obs_t)
             z_tp1 = model.double_encode(obs_tp1)
 
-            # Reconstruction loss (from z_t)
-            reconstruction = model.double_decode(z_t)
+            # Reconstruction loss for BOTH frames
+            recon_t = model.double_decode(z_t)
+            recon_tp1 = model.double_decode(z_tp1)
             if use_weighted_loss:
-                loss_recon = weighted_reconstruction_loss(reconstruction, obs_t)
+                loss_recon = (weighted_reconstruction_loss(recon_t, obs_t)
+                              + weighted_reconstruction_loss(recon_tp1, obs_tp1)) / 2
             else:
-                loss_recon = F.mse_loss(reconstruction, obs_t)
+                loss_recon = (F.mse_loss(recon_t, obs_t)
+                              + F.mse_loss(recon_tp1, obs_tp1)) / 2
+
+            loss = loss_recon
 
             # Dynamics loss: train forward model only
-            z_tp1_pred = forward_model(z_t.detach(), actions)
-            loss_dyn = F.mse_loss(z_tp1_pred, z_tp1.detach())
+            if forward_model is not None:
+                z_tp1_pred = forward_model(z_t.detach(), actions)
+                loss_dyn = F.mse_loss(z_tp1_pred, z_tp1.detach())
+                loss_pred = F.mse_loss(z_tp1, z_tp1_pred.detach())
+                loss = loss + fp_coef * loss_dyn + pred_coef * loss_pred
+                dyn_losses.append(loss_dyn.item())
+                pred_losses.append(loss_pred.item())
 
-            # Predictability loss: nudge encoder only
-            loss_pred = F.mse_loss(z_tp1, z_tp1_pred.detach())
+            # Reward prediction: gradients flow through encoder
+            if reward_model is not None:
+                reward_pred = reward_model(z_t, actions)
+                loss_reward = F.mse_loss(reward_pred, rewards)
+                loss = loss + reward_coef * loss_reward
+                reward_losses.append(loss_reward.item())
 
-            loss = loss_recon + fp_coef * loss_dyn + pred_coef * loss_pred
             loss.backward()
             opt.step()
             opt.zero_grad()
 
             recon_losses.append(loss_recon.item())
-            dyn_losses.append(loss_dyn.item())
-            pred_losses.append(loss_pred.item())
 
         scheduler.step()
         if epoch % 10 == 0:
             spe = cfg['stage2_steps_per_epoch']
-            print(f"  Epoch {epoch}/{cfg['stage2_epochs']} | "
-                  f"Recon: {np.mean(recon_losses[-spe:]):.5f} | "
-                  f"Dynamics: {np.mean(dyn_losses[-spe:]):.5f} | "
-                  f"Predict: {np.mean(pred_losses[-spe:]):.5f}")
+            log = (f"  Epoch {epoch}/{cfg['stage2_epochs']} | "
+                   f"Recon: {np.mean(recon_losses[-spe:]):.5f}")
+            if dyn_losses:
+                log += f" | Dyn: {np.mean(dyn_losses[-spe:]):.5f}"
+            if pred_losses:
+                log += f" | Pred: {np.mean(pred_losses[-spe:]):.5f}"
+            if reward_losses:
+                log += f" | Reward: {np.mean(reward_losses[-spe:]):.5f}"
+            print(log)
 
-    fig, axes = plt.subplots(1, 3, figsize=(16, 4))
-    axes[0].plot(recon_losses); axes[0].set_title('Reconstruction Loss')
-    axes[1].plot(dyn_losses); axes[1].set_title('Dynamics Loss')
-    axes[2].plot(pred_losses); axes[2].set_title('Predictability Loss')
+    n_plots = 1 + bool(dyn_losses) + bool(pred_losses) + bool(reward_losses)
+    fig, axes = plt.subplots(1, n_plots, figsize=(5 * n_plots, 4))
+    if n_plots == 1:
+        axes = [axes]
+    idx = 0
+    axes[idx].plot(recon_losses); axes[idx].set_title('Reconstruction Loss'); idx += 1
+    if dyn_losses:
+        axes[idx].plot(dyn_losses); axes[idx].set_title('Dynamics Loss'); idx += 1
+    if pred_losses:
+        axes[idx].plot(pred_losses); axes[idx].set_title('Predictability Loss'); idx += 1
+    if reward_losses:
+        axes[idx].plot(reward_losses); axes[idx].set_title('Reward Loss'); idx += 1
     for ax in axes:
         ax.set_xlabel('Step')
     plt.tight_layout()
@@ -428,12 +529,22 @@ def main():
                         help='Enable forward prediction auxiliary loss in stage 1')
     parser.add_argument('--intrinsic-forward', action='store_true',
                         help='Enable forward prediction in intrinsic space during stage 2')
+    parser.add_argument('--reward-pred', action='store_true',
+                        help='Add reward prediction loss in stage 2 (intrinsic space)')
+    parser.add_argument('--reward-pred-s1', action='store_true',
+                        help='Add reward prediction loss in stage 1 (conv latent space)')
     parser.add_argument('--fp-coef', type=float, default=0.5,
                         help='Dynamics loss coefficient (default: 0.5)')
     parser.add_argument('--pred-coef', type=float, default=0.1,
                         help='Predictability loss coefficient, only used with split grads (default: 0.1)')
+    parser.add_argument('--reward-coef', type=float, default=0.5,
+                        help='Reward prediction loss coefficient (default: 0.5)')
     parser.add_argument('--direct-grads', action='store_true',
                         help='Use direct forward gradients instead of DreamerV3-style split')
+    parser.add_argument('--stage1-epochs', type=int, default=None,
+                        help='Override stage 1 epoch count')
+    parser.add_argument('--stage2-epochs', type=int, default=None,
+                        help='Override stage 2 epoch count')
     parser.add_argument('--weighted-loss', action='store_true',
                         help='Upweight foreground pixels in reconstruction loss')
     parser.add_argument('--impala', action='store_true',
@@ -442,6 +553,12 @@ def main():
 
     cfg = get_config(args.env)
     ckpt_path = env_path(cfg, "autoencoder.pt")
+
+    # Apply CLI overrides
+    if args.stage1_epochs is not None:
+        cfg['stage1_epochs'] = args.stage1_epochs
+    if args.stage2_epochs is not None:
+        cfg['stage2_epochs'] = args.stage2_epochs
 
     if os.path.isfile(ckpt_path) and not args.force:
         print(f"Checkpoint {ckpt_path} already exists. Use --force to retrain.")
@@ -487,16 +604,34 @@ def main():
     print(f"  Conv dim: {encoder.conv_dim}")
 
     forward_model = None
+    s1_reward_model = None
     t0 = time.time()
-    if args.forward_prediction:
-        # Determine encoder output dim
+    is_discrete = cfg.get('env_type') != 'continuous'
+    cfg['_discrete_actions'] = is_discrete
+
+    # Compute action size for forward/reward models
+    if is_discrete:
+        action_size = cfg.get('num_actions', env.action_space.n)
+    else:
+        action_size = env.action_space.shape[0]
+
+    if args.forward_prediction or args.reward_pred_s1:
         latent_dim_actual = (np.prod(encoder.conv_dim)
                              if cfg['latent_dim'] is None else cfg['latent_dim'])
-        forward_model = ForwardPredictor(
-            latent_dim_actual, cfg['num_actions'], hidden_dim=256).cuda()
+
+        if args.forward_prediction:
+            forward_model = ForwardPredictor(
+                latent_dim_actual, action_size, hidden_dim=256, discrete=is_discrete).cuda()
+
+        if args.reward_pred_s1:
+            s1_reward_model = RewardPredictor(
+                latent_dim_actual, action_size, hidden_dim=256, discrete=is_discrete).cuda()
+
         train_stage1_with_forward(encoder, decoder, forward_model, buffer, cfg,
                                    fp_coef=args.fp_coef,
                                    pred_coef=args.pred_coef,
+                                   reward_coef=args.reward_coef,
+                                   reward_model=s1_reward_model,
                                    use_weighted_loss=use_weighted,
                                    split_gradients=not args.direct_grads)
     else:
@@ -530,13 +665,29 @@ def main():
     visualize_reconstructions(model, buffer, cfg, stage='stage1')
 
     intrinsic_forward_model = None
+    reward_model = None
     t0 = time.time()
-    if args.intrinsic_forward:
-        intrinsic_forward_model = ForwardPredictor(
-            intrinsic_dim, cfg['num_actions'], hidden_dim=128).cuda()
+    if args.intrinsic_forward or args.reward_pred:
+        # Phase 1: Train stage 2 normally (establish good bottleneck)
+        print("\n--- Phase 1: Standard Stage 2 training ---")
+        train_stage2(model, buffer, cfg, use_weighted_loss=use_weighted)
+
+        # Phase 2: Fine-tune with auxiliary losses
+        print("\n--- Phase 2: Fine-tune with auxiliary losses ---")
+
+        if args.intrinsic_forward:
+            intrinsic_forward_model = ForwardPredictor(
+                intrinsic_dim, action_size, hidden_dim=128, discrete=is_discrete).cuda()
+
+        if args.reward_pred:
+            reward_model = RewardPredictor(
+                intrinsic_dim, action_size, hidden_dim=128, discrete=is_discrete).cuda()
+
         train_stage2_with_forward(model, intrinsic_forward_model, buffer, cfg,
                                    fp_coef=args.fp_coef,
                                    pred_coef=args.pred_coef,
+                                   reward_coef=args.reward_coef,
+                                   reward_model=reward_model,
                                    use_weighted_loss=use_weighted)
     else:
         train_stage2(model, buffer, cfg, use_weighted_loss=use_weighted)

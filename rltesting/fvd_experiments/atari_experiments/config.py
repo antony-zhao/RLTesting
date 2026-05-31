@@ -24,41 +24,59 @@ ENVS = {
                      'stage1_epochs': 80, 'stage2_epochs': 80, 'intrinsic_dim_override': 16,
                      'weighted_loss': True},
     'spaceinvaders': {'env_id': 'ALE/SpaceInvaders-v5', 'num_actions': 6, 'env_type': 'atari',
-                  'stage1_epochs': 80, 'stage2_epochs': 80, 'intrinsic_dim_override': 16,
-                  'weighted_loss': True},
-    'assault':      {'env_id': 'ALE/Assault-v5',   'num_actions': 7,  'env_type': 'atari',
-                 'stage1_epochs': 80, 'stage2_epochs': 80, 'intrinsic_dim_override': 12,
-                 'weighted_loss': True},
+                     'stage1_epochs': 80, 'stage2_epochs': 80, 'intrinsic_dim_override': 16,
+                     'weighted_loss': True},
 
     # Classic control
     'cartpole':     {'env_id': 'CartPole-v1',      'num_actions': 2,  'env_type': 'classic',
                      'state_dim': 4,  'gamma': 0.99, 'framestack': 2,
-                     'latent_dim': 256, 
-                     'num_tilings': 16, 'num_tiles_per_dim': 4,
+                     'latent_dim': 256, 'intrinsic_dim_override': 8,
+                     'num_tilings': 8, 'num_tiles_per_dim': 8,
                      'hash_size': 2 ** 16,
                      'alpha_multiplier': 0.1,
                      'sarsa_max_timesteps': 1_000_000, 'sarsa_max_episodes': 100000,
-                     'epsilon_decay_episodes': 500,
+                     'epsilon_decay_episodes': 100, 'epsilon_min': 0.0, 
                      'ppo_timesteps': 1_000_000},
     'acrobot':      {'env_id': 'Acrobot-v1',       'num_actions': 3,  'env_type': 'classic',
                      'state_dim': 6,  'gamma': 1.0, 'framestack': 2,
-                     'latent_dim': 256, 
+                     'latent_dim': 256, 'intrinsic_dim_override': 6,
                      'num_tilings': 32, 'num_tiles_per_dim': 4,
                      'hash_size': 2 ** 18,
                      'alpha_multiplier': 0.1,
                      'sarsa_max_timesteps': 1_000_000, 'sarsa_max_episodes': 100000,
-                     'epsilon_decay_episodes': 500,
+                     'epsilon_decay_episodes': 500, 'epsilon_min': 0.0,
                      'ppo_timesteps': 1_000_000},
     'mountaincar':  {'env_id': 'MountainCar-v0',   'num_actions': 3,  'env_type': 'classic',
-                 'state_dim': 2,  'gamma': 1.0, 'framestack': 2,
-                 'latent_dim': 256, 
-                 'num_tilings': 8, 'num_tiles_per_dim': 8,
-                 'hash_size': 2 ** 16,
-                 'alpha_multiplier': 0.3,
-                 'lam': 0.97, 'data_steps': 200_000,
-                 'sarsa_max_timesteps': 1_000_000, 'sarsa_max_episodes': 100000,
-                 'epsilon_decay_episodes': 2000,
-                 'ppo_timesteps': 1_000_000},
+                     'state_dim': 2,  'gamma': 1.0, 'framestack': 2,
+                     'latent_dim': 256, 'intrinsic_dim_override': 6,
+                     'num_tilings': 8, 'num_tiles_per_dim': 8,
+                     'hash_size': 2 ** 16,
+                     'alpha_multiplier': 0.5,
+                     'lam': 0.95,
+                     'sarsa_max_timesteps': 1_000_000, 'sarsa_max_episodes': 100000,
+                     'epsilon_decay_episodes': 1, 'epsilon_min': 0.0,
+                     'ppo_timesteps': 1_000_000},
+
+    # Continuous control
+    'pendulum':     {'env_id': 'Pendulum-v1',      'env_type': 'continuous',
+                     'state_dim': 3,  'gamma': 0.99, 'framestack': 2,
+                     'num_tilings': 16, 'num_tiles_per_dim': 4,
+                     'hash_size': 2 ** 16,
+                     'alpha_multiplier': 0.1,
+                     'lam': 0.9,
+                     'sarsa_max_timesteps': 500_000, 'sarsa_max_episodes': 5000,
+                     'ppo_timesteps': 1_000_000},
+    'lunarlander':  {'env_id': 'LunarLander-v3',   'env_type': 'continuous',
+                     'state_dim': 8,  'gamma': 0.99, 'framestack': 2,
+                     'continuous': True,
+                     'latent_dim': 256, 'intrinsic_dim_override': 8,
+                     'num_tilings': 64, 'num_tiles_per_dim': 2,
+                     'hash_size': 2 ** 18,
+                     'alpha_multiplier': 0.1,
+                     'cacla_alpha_actor': 0.005,
+                     'lam': 0.9,
+                     'sarsa_max_timesteps': 3_000_000, 'sarsa_max_episodes': 10000,
+                     'ppo_timesteps': 1_000_000},
 }
 
 # ---- Shared defaults ---- #
@@ -77,7 +95,7 @@ DEFAULTS = {
 
     # Autoencoder (stage 1 + 2)
     'latent_dim': None,         # None = no linear projection, use raw conv features
-    'hidden_dim': 128,          # MLP hidden dim for intrinsic encoder/decoder
+    'hidden_dim': 256,          # MLP hidden dim for intrinsic encoder/decoder
     'encoder_type': 'conv',     # 'conv' (original) or 'impala' (residual blocks)
     'id_multiplier': 1.5,      # intrinsic_dim = round(MLE * multiplier)
     'intrinsic_dim_override': None,  # set manually to bypass MLE (e.g. 16)
@@ -99,6 +117,11 @@ DEFAULTS = {
     'sarsa_max_episodes': 10_000,
     'epsilon_decay_episodes': 1000,
     'epsilon_min': 0.05,
+
+    # SARSA(λ) + RFF
+    'rff_num_features': 4096,
+    'rff_bandwidth': 2.0,
+    'rff_alpha': 0.02,
 
     # Fine-tuning (off by default)
     'finetune': False,
@@ -156,8 +179,15 @@ def make_env(cfg, render_mode='rgb_array', mode='default'):
         if mode == 'pixels':
             return _make_classic_pixel_env(cfg, render_mode)
         else:
-            # Raw state — no wrappers needed
             return gym.make(cfg['env_id'], render_mode=render_mode)
+    elif env_type == 'continuous':
+        if mode == 'pixels':
+            return _make_classic_pixel_env(cfg, render_mode)
+        else:
+            kwargs = {}
+            if cfg.get('continuous'):
+                kwargs['continuous'] = True
+            return gym.make(cfg['env_id'], render_mode=render_mode, **kwargs)
     else:
         return _make_atari_env(cfg, render_mode)
 
@@ -193,7 +223,8 @@ def _make_classic_pixel_env(cfg, render_mode):
     fs = cfg.get('framestack', 2)
     img_channels = cfg.get('image_channels', 1)
 
-    env = gym.make(cfg['env_id'], render_mode='rgb_array')
+    env = gym.make(cfg['env_id'], render_mode='rgb_array',
+                   **({'continuous': True} if cfg.get('continuous') else {}))
     env = BasicEnvironmentRGB(env)
     env = ResizeObservation(env, (obs, obs))
     if img_channels == 1:

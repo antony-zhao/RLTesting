@@ -312,8 +312,33 @@ def _run_pixels(cfg):
     gamma = cfg['gamma']
 
     w = np.zeros(hash_size)
-    mins = np.full(intrinsic_dim, -3.0)
-    scale = np.full(intrinsic_dim, num_tiles_per_dim / 6.0)
+
+    # Compute tile bounds from actual encoded data
+    print("Computing tile bounds from encoded data...")
+    sample_z = []
+    for _ in range(20):
+        obs, _ = env.reset()
+        done = False
+        while not done:
+            obs, _, term, trunc, _ = env.step(env.action_space.sample())
+            with torch.no_grad():
+                t = (torch.tensor(np.array(obs)).unsqueeze(0).float().transpose(-3, -1) / 255).cuda()
+                z = to_numpy(model.double_encode(t)).squeeze()
+                z_norm = (z - means) / stds
+            sample_z.append(z_norm)
+            done = term or trunc
+    sample_z = np.array(sample_z)
+    z_min = sample_z.min(axis=0)
+    z_max = sample_z.max(axis=0)
+    margin = (z_max - z_min) * 0.05
+    z_min -= margin
+    z_max += margin
+    z_range = z_max - z_min
+    z_range[z_range == 0] = 1.0
+    mins = z_min
+    scale = np.full(intrinsic_dim, num_tiles_per_dim) / z_range
+    print(f"  Tile bounds: {z_min} to {z_max}")
+    print(f"  Scale: {scale}")
 
     def get_tiles(state, action):
         scaled = ((state - mins) * scale).tolist()
