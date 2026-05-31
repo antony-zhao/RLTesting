@@ -158,6 +158,25 @@ class DreamerMLP(nn.Module):
         
     def forward(self, x):
         return self.layers(x)
+    
+class ContDreamerMLP(nn.Module):
+    def __init__(self, input_dim, output_dim, hidden_dim, num_hiddens, act=nn.SiLU):
+        super().__init__()
+        layers = []
+        layers.append(nn.Linear(input_dim, hidden_dim, bias=False))
+        layers.append(nn.LayerNorm(hidden_dim, eps=1e-5, elementwise_affine=True))
+        layers.append(act())
+        for _ in range(num_hiddens):
+            layers.append(nn.Linear(hidden_dim, hidden_dim, bias=False))
+            layers.append(nn.LayerNorm(hidden_dim, eps=1e-5, elementwise_affine=True))
+            layers.append(act())
+        self.layers = nn.Sequential(*layers)
+        self.mean_head = nn.Linear(hidden_dim, output_dim)
+        self.log_std_head = nn.Linear(hidden_dim, output_dim)
+        
+    def forward(self, x):
+        x = self.layers(x)
+        return self.mean_head(x),self.log_std_head(x)
 
 class DreamerEncoderConv(nn.Module):
     # built for 64x64 observations and downscales them to 4x4, can do other sizes but would need to be changed a bit
